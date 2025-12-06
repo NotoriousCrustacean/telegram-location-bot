@@ -163,7 +163,7 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-    if update.message.text.strip() != "!":
+    if update.message.text.strip() != "1717":
         return
 
     state = load_state()
