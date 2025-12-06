@@ -22,22 +22,30 @@ from telegram.ext import (
     filters,
 )
 
+# ------------ Config / constants ------------
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CLAIM_CODE = os.environ.get("CLAIM_CODE", "").strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
-# Trigger word in group chat
-TRIGGER_WORD = os.environ.get("TRIGGER_WORD", "eta").strip().lower()
+# Both triggers work: "eta" and "1717"
+TRIGGERS = {"eta", "1717"}
 
 TF = TimezoneFinder()
 
-# ------------------ State ------------------
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+
+
+# ------------ Utility / state helpers ------------
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def now_utc_iso() -> str:
     return now_utc().isoformat()
+
 
 def parse_iso(s: str) -> Optional[datetime]:
     try:
@@ -45,11 +53,13 @@ def parse_iso(s: str) -> Optional[datetime]:
     except Exception:
         return None
 
+
 def atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
 
 def load_state() -> dict:
     if STATE_FILE.exists():
@@ -61,19 +71,23 @@ def load_state() -> dict:
         "owner_id": None,
         "allowed_chats": [],
         "last_location": None,  # {"lat","lon","updated_at","tz"}
-        "job": None,            # current load detected from dispatch post
+        "job": None,            # current load
         "job_stage": "PU",      # "PU" or "DEL"
-        "geocode_cache": {},    # address_str -> {"lat","lon"}
+        "geocode_cache": {},    # address str -> {"lat","lon"}
     }
+
 
 def save_state(state: dict) -> None:
     atomic_write_json(STATE_FILE, state)
 
+
 def is_private(update: Update) -> bool:
     return update.effective_chat and update.effective_chat.type == "private"
 
+
 def is_group(update: Update) -> bool:
     return update.effective_chat and update.effective_chat.type in ("group", "supergroup")
+
 
 def is_owner(update: Update, state: dict) -> bool:
     return (
@@ -82,13 +96,16 @@ def is_owner(update: Update, state: dict) -> bool:
         and update.effective_user.id == state["owner_id"]
     )
 
+
 def chat_allowed(state: dict, chat_id: int) -> bool:
     return chat_id in set(state.get("allowed_chats") or [])
+
 
 def h(s: str) -> str:
     return html.escape(s or "", quote=False)
 
-# ------------------ Time & formatting helpers ------------------
+
+# ------------ Time & formatting helpers ------------
 
 def format_delta(dt: datetime) -> str:
     delta = now_utc() - dt
@@ -100,9 +117,10 @@ def format_delta(dt: datetime) -> str:
         return f"{minutes}m ago"
     hours = minutes // 60
     if hours < 48:
-        return f"{hours}h {minutes%60}m ago"
+        return f"{hours}h {minutes % 60}m ago"
     days = hours // 24
     return f"{days}d ago"
+
 
 def fmt_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -110,12 +128,15 @@ def fmt_duration(seconds: float) -> str:
     h_, m = divmod(m, 60)
     return f"{h_}h {m}m" if h_ else f"{m}m"
 
+
 def fmt_distance_miles(meters: float) -> str:
     miles = meters / 1609.344
     return f"{miles:.1f} mi" if miles < 10 else f"{miles:.0f} mi"
 
+
 def best_timezone_for_coords(lat: float, lon: float) -> str:
     return TF.timezone_at(lat=lat, lng=lon) or "UTC"
+
 
 def local_time_str(tz_name: str) -> str:
     try:
@@ -126,10 +147,12 @@ def local_time_str(tz_name: str) -> str:
     dt = now_utc().astimezone(tz)
     return f"{dt.strftime('%Y-%m-%d %H:%M')} ({tz_name})"
 
-# ------------------ Dispatch parsing ------------------
+
+# ------------ Dispatch parsing ------------
 
 PU_TIME_RE = re.compile(r"^\s*PU time:\s*(.+?)\s*$", re.IGNORECASE)
 DEL_TIME_RE = re.compile(r"^\s*DEL time:\s*(.+?)\s*$", re.IGNORECASE)
+
 
 def collect_block(lines: List[str], prefix: str) -> Optional[List[str]]:
     prefix_l = prefix.lower()
@@ -154,6 +177,7 @@ def collect_block(lines: List[str], prefix: str) -> Optional[List[str]]:
                 j += 1
             return block if block else None
     return None
+
 
 def parse_dispatch_post(text: str) -> Optional[dict]:
     if "pu address:" not in text.lower() or "del address:" not in text.lower():
@@ -192,7 +216,8 @@ def parse_dispatch_post(text: str) -> Optional[dict]:
         "set_at": now_utc_iso(),
     }
 
-# ------------------ ETA (Nominatim + OSRM + fallback) ------------------
+
+# ------------ Distance / ETA helpers ------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
@@ -200,8 +225,9 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
+
 
 def fallback_seconds_for_distance_m(meters: float) -> float:
     km = meters / 1000.0
@@ -213,22 +239,62 @@ def fallback_seconds_for_distance_m(meters: float) -> float:
         speed_kph = 105
     return (km / speed_kph) * 3600.0
 
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+
+# ------------ Geocoding / routing (with smarter geocoder) ------------
 
 async def geocode(address: str) -> Optional[Tuple[float, float]]:
+    """
+    Try several progressively simpler variants of the address so we don't
+    fail just because of store names / suites / weird punctuation.
+    """
     headers = {"User-Agent": os.environ.get("NOMINATIM_USER_AGENT", "telegram-location-bot/1.0")}
-    params = {"q": address, "format": "jsonv2", "limit": 1}
+
+    base = address.strip()
+    if not base:
+        return None
+
+    variants = []
+
+    # 1) Full address as-is
+    variants.append(base)
+
+    # Split on commas into parts (store, street, city, state zip, ...)
+    parts = [p.strip() for p in re.split(r",", base) if p.strip()]
+
+    # 2) Drop first chunk (often store name)
+    if len(parts) >= 2:
+        variants.append(", ".join(parts[1:]))
+
+    # 3) Last 2 parts (city + state zip)
+    if len(parts) >= 2:
+        variants.append(", ".join(parts[-2:]))
+
+    # 4) Last 3 parts if available
+    if len(parts) >= 3:
+        variants.append(", ".join(parts[-3:]))
+
+    # Deduplicate while preserving order
+    seen = set()
+    clean_variants = []
+    for v in variants:
+        if v not in seen:
+            seen.add(v)
+            clean_variants.append(v)
+
     try:
         async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
-            r = await client.get(NOMINATIM_URL, params=params)
-            r.raise_for_status()
-            data = r.json()
-            if not data:
-                return None
-            return float(data[0]["lat"]), float(data[0]["lon"])
+            for q in clean_variants:
+                params = {"q": q, "format": "jsonv2", "limit": 1}
+                r = await client.get(NOMINATIM_URL, params=params)
+                r.raise_for_status()
+                data = r.json()
+                if data:
+                    return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
         return None
+
+    return None
+
 
 async def route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optional[Tuple[float, float]]:
     lat1, lon1 = origin
@@ -246,6 +312,7 @@ async def route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optio
     except Exception:
         return None
 
+
 async def get_coords_cached(state: dict, address: str) -> Optional[Tuple[float, float]]:
     cache = state.get("geocode_cache") or {}
     if address in cache:
@@ -259,6 +326,7 @@ async def get_coords_cached(state: dict, address: str) -> Optional[Tuple[float, 
         state["geocode_cache"] = cache
         save_state(state)
     return coords
+
 
 async def compute_eta(state: dict, origin: Tuple[float, float], label: str, address: str) -> dict:
     dest = await get_coords_cached(state, address)
@@ -274,18 +342,22 @@ async def compute_eta(state: dict, origin: Tuple[float, float], label: str, addr
     dur_s = fallback_seconds_for_distance_m(dist_m)
     return {"ok": True, "distance_m": dist_m, "duration_s": dur_s, "method": "approx"}
 
-# ------------------ Commands ------------------
+
+# ------------ Commands ------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    triggers_txt = " or ".join(sorted(TRIGGERS))
     await update.effective_message.reply_text(
         "👋 Hi!\n"
-        f"• Trigger: type “{TRIGGER_WORD}” in an allowed group\n"
-        "• I’ll also auto-detect new dispatch posts (PU/DEL format)\n\n"
+        f"• Trigger: type “{triggers_txt}” in an allowed group\n"
+        "• I’ll auto-detect dispatch posts with PU/DEL format\n\n"
         "Owner setup:\n"
         "1) DM: /claim <code>\n"
-        "2) DM: /update (send current OR Live Location)\n"
+        "2) DM: /update (send current or Live Location)\n"
         "3) Group: /allowhere\n"
+        "Stage control: /pickupdone, /pickuppending, /skip\n"
     )
+
 
 async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update):
@@ -306,6 +378,7 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     await update.effective_message.reply_text("✅ You are now the owner.")
 
+
 async def allowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not is_owner(update, state):
@@ -319,7 +392,9 @@ async def allowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed.add(chat_id)
     state["allowed_chats"] = sorted(list(allowed))
     save_state(state)
-    await update.effective_message.reply_text(f"✅ Allowed. Trigger word: “{TRIGGER_WORD}”")
+    triggers_txt = " or ".join(sorted(TRIGGERS))
+    await update.effective_message.reply_text(f"✅ Allowed. Trigger words: {triggers_txt}")
+
 
 async def disallowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -336,6 +411,7 @@ async def disallowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     await update.effective_message.reply_text("✅ Group removed from allowed list.")
 
+
 async def update_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not is_owner(update, state):
@@ -348,16 +424,17 @@ async def update_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[KeyboardButton("📍 Send my current location", request_location=True)]]
     await update.effective_message.reply_text(
         "Tap to send your current location.\n"
-        "Tip: you can also send a *Live Location* (Attach → Location → Share Live Location) and I’ll update continuously.",
+        "Tip: you can also send a Live Location (Attach → Location → Share Live Location) and I’ll keep it updated.",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True),
     )
+
 
 async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not is_owner(update, state):
         return
 
-    msg = update.effective_message  # IMPORTANT: works for edited live-location updates too
+    msg = update.effective_message
     if not msg or not msg.location:
         return
 
@@ -371,9 +448,10 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_state(state)
 
-    # Only confirm on the first message (avoid spamming on live updates)
+    # Confirm only on initial message (avoid spam on live updates)
     if update.message is not None:
         await msg.reply_text("✅ Saved your location.", reply_markup=ReplyKeyboardRemove())
+
 
 async def pickupdone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -384,6 +462,7 @@ async def pickupdone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_state(state)
     await update.effective_message.reply_text("✅ Stage: DELIVERY")
 
+
 async def pickuppending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not is_owner(update, state):
@@ -392,6 +471,7 @@ async def pickuppending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["job_stage"] = "PU"
     save_state(state)
     await update.effective_message.reply_text("✅ Stage: PICKUP")
+
 
 async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
@@ -413,7 +493,8 @@ async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_state(state)
         await update.effective_message.reply_text("✅ Cleared current job.")
 
-# ------------------ Main text handler (parse jobs + 'eta') ------------------
+
+# ------------ ETA formatting ------------
 
 def job_html(job: dict) -> str:
     pu_time = job.get("pu_time")
@@ -431,6 +512,7 @@ def job_html(job: dict) -> str:
         out.append(f"⏱ {h(del_time)}")
     out.extend(h(x) for x in del_lines)
     return "\n".join(out)
+
 
 async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str = "AUTO"):
     state = load_state()
@@ -454,7 +536,7 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
     job = state.get("job")
     stage = state.get("job_stage", "PU")
 
-    # Send map pin first
+    # Send current pin
     await context.bot.send_location(chat_id=chat.id, latitude=origin[0], longitude=origin[1])
 
     header = [
@@ -464,19 +546,21 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
     ]
 
     if not job:
-        await msg.reply_text("\n".join(header + ["", "<i>No active load detected yet.</i>"]),
-                             parse_mode=ParseMode.HTML)
+        await msg.reply_text(
+            "\n".join(header + ["", "<i>No active load detected yet.</i>"]),
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     header += [
-        f"<b>Stage:</b> {'PICKUP' if stage=='PU' else 'DELIVERY'}",
+        f"<b>Stage:</b> {'PICKUP' if stage == 'PU' else 'DELIVERY'}",
         "",
         job_html(job),
     ]
 
-    # Decide what to compute
+    # Decide which ETA(s) to show
     t = target.upper()
-    which = []
+    which: List[str]
     if t == "BOTH":
         which = ["PU", "DEL"]
     elif t == "PU":
@@ -486,7 +570,7 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
     else:
         which = ["PU" if stage == "PU" else "DEL"]
 
-    lines = []
+    lines: List[str] = []
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
@@ -497,24 +581,37 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
         lines.append("")
         lines.append("<b>ETA to Pickup</b>")
         if r.get("ok"):
-            lines.append(f"🛣 {h(fmt_distance_miles(r['distance_m']))} · ⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})")
+            lines.append(
+                f"🛣 {h(fmt_distance_miles(r['distance_m']))} · "
+                f"⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})"
+            )
             arrive = now_utc().astimezone(tz) + timedelta(seconds=float(r["duration_s"]))
             lines.append(f"🕒 Arrive ~ {h(arrive.strftime('%H:%M'))}")
         else:
-            lines.append(f"⚠️ {h(r.get('error','Could not compute'))}")
+            lines.append(f"⚠️ {h(r.get('error', 'Could not compute'))}")
 
     if "DEL" in which:
         r = await compute_eta(state, origin, "Delivery", job["delivery_address"])
         lines.append("")
         lines.append("<b>ETA to Delivery</b>")
         if r.get("ok"):
-            lines.append(f"🛣 {h(fmt_distance_miles(r['distance_m']))} · ⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})")
+            lines.append(
+                f"🛣 {h(fmt_distance_miles(r['distance_m']))} · "
+                f"⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})"
+            )
             arrive = now_utc().astimezone(tz) + timedelta(seconds=float(r["duration_s"]))
             lines.append(f"🕒 Arrive ~ {h(arrive.strftime('%H:%M'))}")
         else:
-            lines.append(f"⚠️ {h(r.get('error','Could not compute'))}")
+            lines.append(f"⚠️ {h(r.get('error', 'Could not compute'))}")
 
-    await msg.reply_text("\n".join(header + lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    await msg.reply_text(
+        "\n".join(header + lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+# ------------ Text handler (dispatch + triggers) ------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -523,15 +620,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     state = load_state()
-
-    # Group safety gate
-    if is_group(update) and not chat_allowed(state, chat.id):
-        return
-
     text = msg.text.strip()
     low = text.lower()
 
-    # 1) Detect new dispatch post (reset job)
+    # Block if group not allowed
+    if is_group(update) and not chat_allowed(state, chat.id):
+        return
+
+    # 1) Auto-detect dispatch posts in group
     if is_group(update):
         job = parse_dispatch_post(msg.text)
         if job:
@@ -541,27 +637,33 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state["job_stage"] = "PU"
                 save_state(state)
 
-                # Pre-geocode to speed up first ETA
+                # Pre-geocode
                 await get_coords_cached(state, job["pickup_address"])
                 await get_coords_cached(state, job["delivery_address"])
 
                 await msg.reply_text(
                     "📦 New load detected. Stage reset to PICKUP.\n"
-                    f"Type “{TRIGGER_WORD}” for ETA. Owner: /pickupdone or /skip."
+                    "Use /pickupdone when loaded, /skip to jump or clear, "
+                    "and type “eta” or “1717” for ETA.",
                 )
             return
 
-    # 2) Trigger word: "eta" / "eta pu" / "eta del" / "eta both"
-    if low == TRIGGER_WORD or low.startswith(TRIGGER_WORD + " "):
-        arg = low[len(TRIGGER_WORD):].strip()
-        target = "AUTO"
-        if arg in ("pu", "pickup"):
-            target = "PU"
-        elif arg in ("del", "delivery"):
-            target = "DEL"
-        elif arg in ("both", "all"):
-            target = "BOTH"
-        await send_eta(update, context, target=target)
+    # 2) Trigger words: "eta", "1717", and variants with arguments
+    for trig in TRIGGERS:
+        if low == trig or low.startswith(trig + " "):
+            arg = low[len(trig):].strip()
+            target = "AUTO"
+            if arg in ("pu", "pickup"):
+                target = "PU"
+            elif arg in ("del", "delivery"):
+                target = "DEL"
+            elif arg in ("both", "all"):
+                target = "BOTH"
+            await send_eta(update, context, target=target)
+            return
+
+
+# ------------ Main entrypoint ------------
 
 def main():
     if not TOKEN:
@@ -579,11 +681,11 @@ def main():
     app.add_handler(CommandHandler("pickuppending", pickuppending))
     app.add_handler(CommandHandler("skip", skip))
 
-    # Important: live-location updates arrive as edited messages
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
