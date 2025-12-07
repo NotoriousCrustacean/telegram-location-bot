@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import html
 import json
 import math
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -13,31 +15,49 @@ from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.constants import ParseMode
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
-# ------------ Config / constants ------------
+# ------------------ Config ------------------
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CLAIM_CODE = os.environ.get("CLAIM_CODE", "").strip()
 STATE_FILE = Path(os.environ.get("STATE_FILE", "state.json"))
 
-# Both triggers work: "eta" and "1717"
-TRIGGERS = {"eta", "1717"}
+# Trigger words: default "eta" and "1717" (change via env TRIGGERS="eta,1717")
+TRIGGERS = {
+    t.strip().lower()
+    for t in os.environ.get("TRIGGERS", "eta,1717").split(",")
+    if t.strip()
+}
 
 TF = TimezoneFinder()
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
 
+# IMPORTANT: Set NOMINATIM_USER_AGENT to something unique in Railway Variables
+# Example: "MyDispatchBot/1.0 (yourname@email.com)"
+NOMINATIM_USER_AGENT = os.environ.get(
+    "NOMINATIM_USER_AGENT", "telegram-dispatch-eta-bot/1.0"
+).strip()
+NOMINATIM_MIN_INTERVAL = float(os.environ.get("NOMINATIM_MIN_INTERVAL", "1.1"))
 
-# ------------ Utility / state helpers ------------
+# Delete-all settings (how many messages to attempt)
+DELETEALL_DEFAULT = int(os.environ.get("DELETEALL_DEFAULT", "500"))
+DELETEALL_MAX = int(os.environ.get("DELETEALL_MAX", "5000"))
+
+_nominatim_lock = asyncio.Lock()
+_nominatim_last_request = 0.0
+
+
+# ------------------ Basic helpers ------------------
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -71,9 +91,9 @@ def load_state() -> dict:
         "owner_id": None,
         "allowed_chats": [],
         "last_location": None,  # {"lat","lon","updated_at","tz"}
-        "job": None,            # current load
+        "job": None,            # active job dict
         "job_stage": "PU",      # "PU" or "DEL"
-        "geocode_cache": {},    # address str -> {"lat","lon"}
+        "geocode_cache": {},    # address -> {"lat","lon"}
     }
 
 
@@ -82,11 +102,15 @@ def save_state(state: dict) -> None:
 
 
 def is_private(update: Update) -> bool:
-    return update.effective_chat and update.effective_chat.type == "private"
+    return bool(update.effective_chat and update.effective_chat.type == "private")
 
 
 def is_group(update: Update) -> bool:
-    return update.effective_chat and update.effective_chat.type in ("group", "supergroup")
+    return bool(update.effective_chat and update.effective_chat.type in ("group", "supergroup"))
+
+
+def chat_allowed(state: dict, chat_id: int) -> bool:
+    return chat_id in set(state.get("allowed_chats") or [])
 
 
 def is_owner(update: Update, state: dict) -> bool:
@@ -97,15 +121,9 @@ def is_owner(update: Update, state: dict) -> bool:
     )
 
 
-def chat_allowed(state: dict, chat_id: int) -> bool:
-    return chat_id in set(state.get("allowed_chats") or [])
-
-
 def h(s: str) -> str:
     return html.escape(s or "", quote=False)
 
-
-# ------------ Time & formatting helpers ------------
 
 def format_delta(dt: datetime) -> str:
     delta = now_utc() - dt
@@ -148,7 +166,7 @@ def local_time_str(tz_name: str) -> str:
     return f"{dt.strftime('%Y-%m-%d %H:%M')} ({tz_name})"
 
 
-# ------------ Dispatch parsing ------------
+# ------------------ Dispatch parsing ------------------
 
 PU_TIME_RE = re.compile(r"^\s*PU time:\s*(.+?)\s*$", re.IGNORECASE)
 DEL_TIME_RE = re.compile(r"^\s*DEL time:\s*(.+?)\s*$", re.IGNORECASE)
@@ -217,7 +235,7 @@ def parse_dispatch_post(text: str) -> Optional[dict]:
     }
 
 
-# ------------ Distance / ETA helpers ------------
+# ------------------ ETA utilities ------------------
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
@@ -240,54 +258,65 @@ def fallback_seconds_for_distance_m(meters: float) -> float:
     return (km / speed_kph) * 3600.0
 
 
-# ------------ Geocoding / routing (with smarter geocoder) ------------
+def _strip_suite_unit(s: str) -> str:
+    return re.sub(r"\b(?:suite|ste|unit|#)\s*[\w\-]+\b", "", s, flags=re.IGNORECASE).strip()
 
-async def geocode(address: str) -> Optional[Tuple[float, float]]:
-    """
-    Try several progressively simpler variants of the address so we don't
-    fail just because of store names / suites / weird punctuation.
-    """
-    headers = {"User-Agent": os.environ.get("NOMINATIM_USER_AGENT", "telegram-location-bot/1.0")}
 
-    base = address.strip()
+def address_variants(address: str) -> List[str]:
+    base = " ".join(address.strip().split())
     if not base:
-        return None
+        return []
 
-    variants = []
+    variants: List[str] = [base]
+    parts = [p.strip() for p in base.split(",") if p.strip()]
 
-    # 1) Full address as-is
-    variants.append(base)
-
-    # Split on commas into parts (store, street, city, state zip, ...)
-    parts = [p.strip() for p in re.split(r",", base) if p.strip()]
-
-    # 2) Drop first chunk (often store name)
     if len(parts) >= 2:
         variants.append(", ".join(parts[1:]))
 
-    # 3) Last 2 parts (city + state zip)
+    variants.append(_strip_suite_unit(base))
+    if len(parts) >= 2:
+        variants.append(_strip_suite_unit(", ".join(parts[1:])))
+
     if len(parts) >= 2:
         variants.append(", ".join(parts[-2:]))
-
-    # 4) Last 3 parts if available
     if len(parts) >= 3:
         variants.append(", ".join(parts[-3:]))
 
-    # Deduplicate while preserving order
+    out: List[str] = []
     seen = set()
-    clean_variants = []
     for v in variants:
-        if v not in seen:
-            seen.add(v)
-            clean_variants.append(v)
+        v2 = " ".join(v.split())
+        if v2 and v2 not in seen:
+            seen.add(v2)
+            out.append(v2)
+    return out
+
+
+async def _nominatim_get(client: httpx.AsyncClient, params: dict) -> httpx.Response:
+    global _nominatim_last_request
+    async with _nominatim_lock:
+        now = time.monotonic()
+        wait = (_nominatim_last_request + NOMINATIM_MIN_INTERVAL) - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        resp = await client.get(NOMINATIM_URL, params=params)
+        _nominatim_last_request = time.monotonic()
+        return resp
+
+
+async def geocode(address: str) -> Optional[Tuple[float, float]]:
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+    candidates = address_variants(address)
+    if not candidates:
+        return None
 
     try:
-        async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
-            for q in clean_variants:
-                params = {"q": q, "format": "jsonv2", "limit": 1}
-                r = await client.get(NOMINATIM_URL, params=params)
-                r.raise_for_status()
-                data = r.json()
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+            for q in candidates:
+                resp = await _nominatim_get(client, {"q": q, "format": "jsonv2", "limit": 1})
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
                 if data:
                     return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception:
@@ -301,9 +330,10 @@ async def route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optio
     lat2, lon2 = dest
     url = OSRM_URL.format(lon1=lon1, lat1=lat1, lon2=lon2, lat2=lat2)
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             r = await client.get(url, params={"overview": "false"})
-            r.raise_for_status()
+            if r.status_code >= 400:
+                return None
             js = r.json()
             routes = js.get("routes") or []
             if not routes:
@@ -320,6 +350,7 @@ async def get_coords_cached(state: dict, address: str) -> Optional[Tuple[float, 
             return float(cache[address]["lat"]), float(cache[address]["lon"])
         except Exception:
             pass
+
     coords = await geocode(address)
     if coords:
         cache[address] = {"lat": coords[0], "lon": coords[1]}
@@ -343,29 +374,30 @@ async def compute_eta(state: dict, origin: Tuple[float, float], label: str, addr
     return {"ok": True, "distance_m": dist_m, "duration_s": dur_s, "method": "approx"}
 
 
-# ------------ Commands ------------
+# ------------------ Commands ------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    triggers_txt = " or ".join(sorted(TRIGGERS))
+    triggers = " / ".join(sorted(TRIGGERS))
     await update.effective_message.reply_text(
-        "👋 Hi!\n"
-        f"• Trigger: type “{triggers_txt}” in an allowed group\n"
-        "• I’ll auto-detect dispatch posts with PU/DEL format\n\n"
+        "👋 Hi! I can post your saved location + an ETA based on the latest dispatch post.\n\n"
+        f"Triggers in allowed groups: {triggers}\n"
+        "Examples: eta | eta pu | eta del | eta both (same works with 1717)\n\n"
         "Owner setup:\n"
         "1) DM: /claim <code>\n"
-        "2) DM: /update (send current or Live Location)\n"
-        "3) Group: /allowhere\n"
-        "Stage control: /pickupdone, /pickuppending, /skip\n"
+        "2) DM: /update (send location OR Share Live Location)\n"
+        "3) Group: /allowhere\n\n"
+        "Owner controls: /pickupdone, /pickuppending, /skip, /leave, /deleteall"
     )
 
 
 async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update):
-        await update.effective_message.reply_text("Please DM me /claim.")
+        await update.effective_message.reply_text("Please DM me /claim (for safety).")
         return
     if not CLAIM_CODE:
         await update.effective_message.reply_text("Missing CLAIM_CODE in Railway Variables.")
         return
+
     code = " ".join(context.args or []).strip()
     if not code:
         await update.effective_message.reply_text("Use: /claim <your_code>")
@@ -373,6 +405,7 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if code != CLAIM_CODE:
         await update.effective_message.reply_text("❌ Wrong claim code.")
         return
+
     state = load_state()
     state["owner_id"] = update.effective_user.id
     save_state(state)
@@ -385,15 +418,15 @@ async def allowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Only the owner can do that.")
         return
     if not is_group(update):
-        await update.effective_message.reply_text("Run this inside the target group.")
+        await update.effective_message.reply_text("Run this inside the group you want to allow.")
         return
+
     chat_id = update.effective_chat.id
-    allowed = set(state.get("allowed_chats", []))
+    allowed = set(state.get("allowed_chats") or [])
     allowed.add(chat_id)
     state["allowed_chats"] = sorted(list(allowed))
     save_state(state)
-    triggers_txt = " or ".join(sorted(TRIGGERS))
-    await update.effective_message.reply_text(f"✅ Allowed. Trigger words: {triggers_txt}")
+    await update.effective_message.reply_text("✅ This group is allowed.")
 
 
 async def disallowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,10 +435,11 @@ async def disallowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Only the owner can do that.")
         return
     if not is_group(update):
-        await update.effective_message.reply_text("Run this inside the target group.")
+        await update.effective_message.reply_text("Run this inside the group you want to remove.")
         return
+
     chat_id = update.effective_chat.id
-    allowed = set(state.get("allowed_chats", []))
+    allowed = set(state.get("allowed_chats") or [])
     allowed.discard(chat_id)
     state["allowed_chats"] = sorted(list(allowed))
     save_state(state)
@@ -415,16 +449,16 @@ async def disallowhere(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def update_loc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_state()
     if not is_owner(update, state):
-        await update.effective_message.reply_text("Only the owner can update location.")
+        await update.effective_message.reply_text("Only the owner can update the saved location.")
         return
     if not is_private(update):
-        await update.effective_message.reply_text("DM me /update (best).")
+        await update.effective_message.reply_text("Please DM me /update (best).")
         return
 
     kb = [[KeyboardButton("📍 Send my current location", request_location=True)]]
     await update.effective_message.reply_text(
-        "Tap to send your current location.\n"
-        "Tip: you can also send a Live Location (Attach → Location → Share Live Location) and I’ll keep it updated.",
+        "Tap the button to send your current location.\n"
+        "Tip: you can also Share Live Location (Attach → Location → Share Live Location) and I’ll keep updating.",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True),
     )
 
@@ -448,7 +482,7 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     save_state(state)
 
-    # Confirm only on initial message (avoid spam on live updates)
+    # Only confirm on the initial location message (avoid spam on live updates)
     if update.message is not None:
         await msg.reply_text("✅ Saved your location.", reply_markup=ReplyKeyboardRemove())
 
@@ -460,7 +494,7 @@ async def pickupdone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state["job_stage"] = "DEL"
     save_state(state)
-    await update.effective_message.reply_text("✅ Stage: DELIVERY")
+    await update.effective_message.reply_text("✅ Stage set to DELIVERY.")
 
 
 async def pickuppending(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -470,7 +504,7 @@ async def pickuppending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     state["job_stage"] = "PU"
     save_state(state)
-    await update.effective_message.reply_text("✅ Stage: PICKUP")
+    await update.effective_message.reply_text("✅ Stage set to PICKUP.")
 
 
 async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,7 +528,100 @@ async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("✅ Cleared current job.")
 
 
-# ------------ ETA formatting ------------
+async def leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = load_state()
+    if not is_owner(update, state):
+        await update.effective_message.reply_text("Only the owner can make me leave.")
+        return
+
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.effective_message.reply_text("I can’t leave private chats. Just delete/block the bot chat.")
+        return
+
+    allowed = set(state.get("allowed_chats") or [])
+    allowed.discard(chat.id)
+    state["allowed_chats"] = sorted(list(allowed))
+    save_state(state)
+
+    await update.effective_message.reply_text("👋 Leaving this chat.")
+    await context.bot.leave_chat(chat.id)
+
+
+async def deleteall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Attempts to delete a bunch of recent messages in the current chat.
+    Usage:
+      /deleteall          -> deletes last DELETEALL_DEFAULT messages
+      /deleteall 1000     -> deletes last 1000 messages (up to DELETEALL_MAX)
+      /deleteall all      -> deletes last DELETEALL_MAX messages
+    """
+    state = load_state()
+    if not is_owner(update, state):
+        await update.effective_message.reply_text("Only the owner can run /deleteall.")
+        return
+
+    chat = update.effective_chat
+    if not chat:
+        return
+    if chat.type == "private":
+        await update.effective_message.reply_text(
+            "Bots can’t “clear” a whole private chat history. You can delete the chat from your side."
+        )
+        return
+
+    count = DELETEALL_DEFAULT
+    if context.args:
+        a = context.args[0].strip().lower()
+        if a in ("all", "max"):
+            count = DELETEALL_MAX
+        else:
+            try:
+                count = int(a)
+            except ValueError:
+                await update.effective_message.reply_text("Use: /deleteall [number|all]")
+                return
+
+    count = max(1, min(count, DELETEALL_MAX))
+
+    notice = await update.effective_message.reply_text(f"🧹 Deleting up to {count} recent messages…")
+
+    start_id = notice.message_id
+    end_id = max(1, start_id - count + 1)
+
+    try:
+        for chunk_end in range(start_id, end_id - 1, -100):
+            chunk_start = max(end_id, chunk_end - 99)
+            ids = list(range(chunk_start, chunk_end + 1))
+
+            try:
+                await context.bot.delete_messages(chat_id=chat.id, message_ids=ids)
+            except RetryAfter as e:
+                await asyncio.sleep(float(getattr(e, "retry_after", 1.0)) + 0.2)
+                await context.bot.delete_messages(chat_id=chat.id, message_ids=ids)
+            except Forbidden:
+                try:
+                    await notice.edit_text("❌ I need admin 'Delete messages' permission in this chat.")
+                except Exception:
+                    pass
+                return
+            except BadRequest:
+                for mid in ids:
+                    try:
+                        await context.bot.delete_message(chat_id=chat.id, message_id=mid)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.03)
+
+            await asyncio.sleep(0.05)
+    except TelegramError:
+        try:
+            await notice.edit_text("⚠️ Couldn’t delete messages (permissions or Telegram limits).")
+        except Exception:
+            pass
+
+
+# ------------------ ETA response ------------------
 
 def job_html(job: dict) -> str:
     pu_time = job.get("pu_time")
@@ -506,6 +633,7 @@ def job_html(job: dict) -> str:
     if pu_time:
         out.append(f"⏱ {h(pu_time)}")
     out.extend(h(x) for x in pu_lines)
+
     out.append("")
     out.append("<b>Delivery</b>")
     if del_time:
@@ -523,6 +651,8 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
 
     if is_group(update) and not chat_allowed(state, chat.id):
         return
+    if is_private(update) and not is_owner(update, state):
+        return
 
     loc = state.get("last_location")
     if not loc:
@@ -536,7 +666,6 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
     job = state.get("job")
     stage = state.get("job_stage", "PU")
 
-    # Send current pin
     await context.bot.send_location(chat_id=chat.id, latitude=origin[0], longitude=origin[1])
 
     header = [
@@ -546,10 +675,7 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
     ]
 
     if not job:
-        await msg.reply_text(
-            "\n".join(header + ["", "<i>No active load detected yet.</i>"]),
-            parse_mode=ParseMode.HTML,
-        )
+        await msg.reply_text("\n".join(header + ["", "<i>No active load detected yet.</i>"]), parse_mode="HTML")
         return
 
     header += [
@@ -558,9 +684,7 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
         job_html(job),
     ]
 
-    # Decide which ETA(s) to show
     t = target.upper()
-    which: List[str]
     if t == "BOTH":
         which = ["PU", "DEL"]
     elif t == "PU":
@@ -570,21 +694,18 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
     else:
         which = ["PU" if stage == "PU" else "DEL"]
 
-    lines: List[str] = []
     try:
         tz = ZoneInfo(tz_name)
     except Exception:
         tz = timezone.utc
 
+    lines: List[str] = []
+
     if "PU" in which:
         r = await compute_eta(state, origin, "Pickup", job["pickup_address"])
-        lines.append("")
-        lines.append("<b>ETA to Pickup</b>")
+        lines += ["", "<b>ETA to Pickup</b>"]
         if r.get("ok"):
-            lines.append(
-                f"🛣 {h(fmt_distance_miles(r['distance_m']))} · "
-                f"⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})"
-            )
+            lines.append(f"🛣 {h(fmt_distance_miles(r['distance_m']))} · ⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})")
             arrive = now_utc().astimezone(tz) + timedelta(seconds=float(r["duration_s"]))
             lines.append(f"🕒 Arrive ~ {h(arrive.strftime('%H:%M'))}")
         else:
@@ -592,13 +713,9 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
 
     if "DEL" in which:
         r = await compute_eta(state, origin, "Delivery", job["delivery_address"])
-        lines.append("")
-        lines.append("<b>ETA to Delivery</b>")
+        lines += ["", "<b>ETA to Delivery</b>"]
         if r.get("ok"):
-            lines.append(
-                f"🛣 {h(fmt_distance_miles(r['distance_m']))} · "
-                f"⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})"
-            )
+            lines.append(f"🛣 {h(fmt_distance_miles(r['distance_m']))} · ⏳ {h(fmt_duration(r['duration_s']))} ({h(r['method'])})")
             arrive = now_utc().astimezone(tz) + timedelta(seconds=float(r["duration_s"]))
             lines.append(f"🕒 Arrive ~ {h(arrive.strftime('%H:%M'))}")
         else:
@@ -606,12 +723,12 @@ async def send_eta(update: Update, context: ContextTypes.DEFAULT_TYPE, target: s
 
     await msg.reply_text(
         "\n".join(header + lines),
-        parse_mode=ParseMode.HTML,
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
 
-# ------------ Text handler (dispatch + triggers) ------------
+# ------------------ Text handler ------------------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -620,14 +737,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     state = load_state()
-    text = msg.text.strip()
-    low = text.lower()
+    low = msg.text.strip().lower()
 
-    # Block if group not allowed
     if is_group(update) and not chat_allowed(state, chat.id):
         return
 
-    # 1) Auto-detect dispatch posts in group
     if is_group(update):
         job = parse_dispatch_post(msg.text)
         if job:
@@ -637,35 +751,30 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state["job_stage"] = "PU"
                 save_state(state)
 
-                # Pre-geocode
                 await get_coords_cached(state, job["pickup_address"])
                 await get_coords_cached(state, job["delivery_address"])
 
+                triggers = " / ".join(sorted(TRIGGERS))
                 await msg.reply_text(
                     "📦 New load detected. Stage reset to PICKUP.\n"
-                    "Use /pickupdone when loaded, /skip to jump or clear, "
-                    "and type “eta” or “1717” for ETA.",
+                    f"Type {triggers} for ETA. Owner: /pickupdone when loaded, /skip to skip/clear."
                 )
             return
 
-    # 2) Trigger words: "eta", "1717", and variants with arguments
-    for trig in TRIGGERS:
-        if low == trig or low.startswith(trig + " "):
-            arg = low[len(trig):].strip()
-            target = "AUTO"
-            if arg in ("pu", "pickup"):
-                target = "PU"
-            elif arg in ("del", "delivery"):
-                target = "DEL"
-            elif arg in ("both", "all"):
-                target = "BOTH"
-            await send_eta(update, context, target=target)
-            return
+    first, *rest = low.split(maxsplit=1)
+    if first in TRIGGERS:
+        arg = rest[0].strip() if rest else ""
+        target = "AUTO"
+        if arg in ("pu", "pickup"):
+            target = "PU"
+        elif arg in ("del", "delivery"):
+            target = "DEL"
+        elif arg in ("both", "all"):
+            target = "BOTH"
+        await send_eta(update, context, target=target)
 
 
-# ------------ Main entrypoint ------------
-
-def main():
+def main() -> None:
     if not TOKEN:
         raise RuntimeError("Missing TELEGRAM_TOKEN")
 
@@ -676,13 +785,17 @@ def main():
     app.add_handler(CommandHandler("allowhere", allowhere))
     app.add_handler(CommandHandler("disallowhere", disallowhere))
     app.add_handler(CommandHandler("update", update_loc))
-
     app.add_handler(CommandHandler("pickupdone", pickupdone))
     app.add_handler(CommandHandler("pickuppending", pickuppending))
     app.add_handler(CommandHandler("skip", skip))
+    app.add_handler(CommandHandler("leave", leave))
+    app.add_handler(CommandHandler("deleteall", deleteall))
 
-    app.add_handler(MessageHandler(filters.LOCATION, on_location))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    # Live location updates are edited messages, so listen to both.
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.LOCATION, on_location))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, on_location))
+
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND, on_text))
 
     app.run_polling(close_loop=False)
 
