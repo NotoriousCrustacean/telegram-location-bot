@@ -1,4 +1,5 @@
 python-telegram-bot==22.5
-httpx==0.28.1
-timezonefinder==8.1.0
-tzdata==2025.2
+httpx>=0.27,<1.0
+timezonefinder>=6.5,<7.0
+tzdata
+Pillow
