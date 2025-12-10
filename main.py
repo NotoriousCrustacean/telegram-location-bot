@@ -36,20 +36,25 @@ from telegram.ext import (
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
-BOT_VERSION = "2025-12-10_clean_retry"
+BOT_VERSION = "2025-12-10_full_clean"
 
-# ---------- ENV helpers ----------
+
+# ----------------------------
+# Environment helpers
+# ----------------------------
 def _strip_quotes(s: str) -> str:
     s = (s or "").strip()
     if len(s) >= 2 and ((s[0] == s[-1] == '"') or (s[0] == s[-1] == "'")):
         return s[1:-1].strip()
     return s
 
+
 def env_str(name: str, default: str = "") -> str:
     v = os.environ.get(name)
     if v is None:
         return default
     return _strip_quotes(v)
+
 
 def env_int(name: str, default: int) -> int:
     v = env_str(name, "")
@@ -60,6 +65,7 @@ def env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
+
 def env_float(name: str, default: float) -> float:
     v = env_str(name, "")
     if not v:
@@ -69,13 +75,17 @@ def env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
 def env_bool(name: str, default: bool = False) -> bool:
     v = env_str(name, "")
     if not v:
         return default
     return v.lower() in ("1", "true", "yes", "y", "on")
 
-# ---------- ENV ----------
+
+# ----------------------------
+# ENV
+# ----------------------------
 TOKEN = env_str("TELEGRAM_TOKEN", "")
 CLAIM_CODE = env_str("CLAIM_CODE", "")
 
@@ -93,11 +103,15 @@ ALERT_TTL_SECONDS = env_int("ALERT_TTL_SECONDS", 25)
 
 DEBUG = env_bool("DEBUG", False)
 
+
 def log(msg: str) -> None:
     if DEBUG:
         print(f"[bot {BOT_VERSION}] {msg}", flush=True)
 
-# ---------- GLOBALS ----------
+
+# ----------------------------
+# Globals
+# ----------------------------
 TF = TimezoneFinder()
 NOM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
@@ -106,12 +120,17 @@ _state_lock = asyncio.Lock()
 _geo_lock = asyncio.Lock()
 _geo_last = 0.0
 
-# ---------- time helpers ----------
+
+# ----------------------------
+# Time helpers
+# ----------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def now_iso() -> str:
     return now_utc().isoformat()
+
 
 def safe_tz(name: str):
     try:
@@ -119,18 +138,22 @@ def safe_tz(name: str):
     except Exception:
         return timezone.utc
 
+
 def h(x: Any) -> str:
     return html.escape("" if x is None else str(x), quote=False)
+
 
 def local_stamp(tz_name: str) -> str:
     tz = safe_tz(tz_name or "UTC")
     return now_utc().astimezone(tz).strftime("%Y-%m-%d %H:%M")
 
-# ---------- STATE ----------
+
+# ----------------------------
+# State load/save
+# ----------------------------
 def _migrate_state(st: dict) -> Tuple[dict, bool]:
     changed = False
 
-    # owner <-> owner_id
     if st.get("owner_id") is None and st.get("owner") is not None:
         st["owner_id"] = st.get("owner")
         changed = True
@@ -138,7 +161,6 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["owner"] = st.get("owner_id")
         changed = True
 
-    # allowed <-> allowed_chats
     if (not st.get("allowed_chats")) and st.get("allowed"):
         st["allowed_chats"] = st.get("allowed")
         changed = True
@@ -146,7 +168,6 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["allowed"] = st.get("allowed_chats")
         changed = True
 
-    # last <-> last_location
     if st.get("last_location") is None and st.get("last") is not None:
         ll = st.get("last") or {}
         st["last_location"] = {
@@ -166,7 +187,6 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         }
         changed = True
 
-    # gc <-> geocode_cache
     if (not st.get("geocode_cache")) and st.get("gc"):
         st["geocode_cache"] = st.get("gc")
         changed = True
@@ -174,7 +194,6 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["gc"] = st.get("geocode_cache")
         changed = True
 
-    # hist <-> history
     if (not st.get("history")) and st.get("hist"):
         st["history"] = st.get("hist")
         changed = True
@@ -182,7 +201,6 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["hist"] = st.get("history")
         changed = True
 
-    # focus index
     if st.get("focus_i") is None and st.get("del_index") is not None:
         st["focus_i"] = st.get("del_index")
         changed = True
@@ -195,7 +213,6 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
     st.setdefault("geocode_cache", {})
     st.setdefault("history", [])
 
-    # keep aliases too
     st["owner"] = st.get("owner_id")
     st["allowed"] = st.get("allowed_chats")
     st["gc"] = st.get("geocode_cache")
@@ -203,8 +220,10 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
 
     return st, changed
 
+
 def load_state() -> dict:
     global STATE_FILE
+
     if (not STATE_FILE.exists()) and STATE_FALLBACK.exists():
         STATE_FILE = STATE_FALLBACK
 
@@ -224,6 +243,7 @@ def load_state() -> dict:
             pass
     return st
 
+
 def save_state(st: dict) -> None:
     global STATE_FILE
 
@@ -240,9 +260,11 @@ def save_state(st: dict) -> None:
         STATE_FILE = STATE_FALLBACK
         _write(STATE_FILE)
 
+
 def is_owner(update: Update, st: dict) -> bool:
     u = update.effective_user
     return bool(u and st.get("owner_id") and u.id == st["owner_id"])
+
 
 def chat_allowed(update: Update, st: dict) -> bool:
     chat = update.effective_chat
@@ -252,7 +274,10 @@ def chat_allowed(update: Update, st: dict) -> bool:
         return is_owner(update, st)
     return chat.id in set(st.get("allowed_chats") or [])
 
-# ---------- GEO ----------
+
+# ----------------------------
+# Geocode/routing
+# ----------------------------
 def hav_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -261,10 +286,12 @@ def hav_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.asin(math.sqrt(a))
 
+
 def fallback_seconds(dist_m: float) -> float:
     km = dist_m / 1000.0
     sp = 55 if km < 80 else (85 if km < 320 else 105)
     return (km / sp) * 3600.0
+
 
 def fmt_dur(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -273,9 +300,11 @@ def fmt_dur(seconds: float) -> str:
     m = m % 60
     return f"{h_}h {m}m" if h_ else f"{m}m"
 
+
 def fmt_mi(meters: float) -> str:
     mi = meters / 1609.344
     return f"{mi:.1f} mi" if mi < 10 else f"{mi:.0f} mi"
+
 
 def addr_variants(addr: str) -> List[str]:
     a = " ".join((addr or "").split())
@@ -284,7 +313,7 @@ def addr_variants(addr: str) -> List[str]:
     out = [a]
     parts = [p.strip() for p in a.split(",") if p.strip()]
     if len(parts) >= 2:
-        out.append(", ".join(parts[1:]))  # drop business name line
+        out.append(", ".join(parts[1:]))
     out.append(re.sub(r"\b(?:suite|ste|unit|#)\s*[\w\-]+\b", "", a, flags=re.I).strip())
     if len(parts) >= 2:
         out.append(", ".join(parts[-2:]))
@@ -295,6 +324,7 @@ def addr_variants(addr: str) -> List[str]:
             seen.add(x)
             res.append(x)
     return res
+
 
 async def geocode_cached(st: dict, addr: str) -> Optional[Tuple[float, float, str]]:
     cache = st.get("geocode_cache") or {}
@@ -337,7 +367,9 @@ async def geocode_cached(st: dict, addr: str) -> Optional[Tuple[float, float, st
                 save_state(st2)
 
             return lat, lon, tz
+
     return None
+
 
 async def route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optional[Tuple[float, float]]:
     url = OSRM_URL.format(lon1=origin[1], lat1=origin[0], lon2=dest[1], lat2=dest[0])
@@ -354,6 +386,7 @@ async def route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optio
     except Exception:
         return None
 
+
 async def eta_to(st: dict, origin: Tuple[float, float], label: str, addr: str) -> dict:
     g = await geocode_cached(st, addr)
     if not g:
@@ -365,7 +398,10 @@ async def eta_to(st: dict, origin: Tuple[float, float], label: str, addr: str) -
     dist = hav_m(origin[0], origin[1], dest[0], dest[1])
     return {"ok": True, "m": dist, "s": fallback_seconds(dist), "method": "approx", "tz": g[2]}
 
-# ---------- parsing ----------
+
+# ----------------------------
+# Load parsing
+# ----------------------------
 RATE_RE = re.compile(r"\b(?:RATE|PAY)\b\s*:\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", re.I)
 MILES_RE = re.compile(r"\b(?:LOADED|MILES)\b\s*:\s*([0-9][0-9,]*)", re.I)
 
@@ -379,6 +415,7 @@ LOAD_DATE_RE = re.compile(r"^\s*Load Date\s*:\s*(.+)$", re.I)
 PICKUP_RE = re.compile(r"^\s*Pickup\s*:\s*(.+)$", re.I)
 DELIVERY_RE = re.compile(r"^\s*Delivery\s*:\s*(.+)$", re.I)
 TIMEISH = re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2})\b")
+
 
 def extract_rate_miles(text: str) -> Tuple[Optional[float], Optional[int]]:
     rate = None
@@ -396,6 +433,7 @@ def extract_rate_miles(text: str) -> Tuple[Optional[float], Optional[int]]:
         except Exception:
             pass
     return rate, miles
+
 
 def take_block(lines: List[str], i: int, first: str) -> Tuple[List[str], int]:
     out = []
@@ -415,6 +453,7 @@ def take_block(lines: List[str], i: int, first: str) -> Tuple[List[str], int]:
         j += 1
     return out, j
 
+
 def init_job(job: dict) -> dict:
     job.setdefault("meta", {})
     pu = job.setdefault("pu", {})
@@ -427,6 +466,7 @@ def init_job(job: dict) -> dict:
         d.setdefault("docs", {"pod": False})
     return job
 
+
 def normalize_job(job: Optional[dict]) -> Optional[dict]:
     if not job or not isinstance(job, dict):
         return None
@@ -434,10 +474,12 @@ def normalize_job(job: Optional[dict]) -> Optional[dict]:
         return init_job(job)
     return init_job(job)
 
+
 def parse_detailed(text: str) -> Optional[dict]:
     low = text.lower()
     if "pu address" not in low or "del address" not in low:
         return None
+
     lines = [ln.rstrip() for ln in text.splitlines()]
     pu_time = None
     cur_del_time = None
@@ -451,21 +493,26 @@ def parse_detailed(text: str) -> Optional[dict]:
         m = LOAD_NUM_RE.match(ln)
         if m:
             load_num = m.group(1).strip()
+
         m = LOAD_DATE_RE.match(ln)
         if m:
             load_date = m.group(1).strip()
+
         m = PU_TIME_RE.match(ln)
         if m:
             pu_time = m.group(1).strip()
+
         m = DEL_TIME_RE.match(ln)
         if m:
             cur_del_time = m.group(1).strip()
+
         m = PU_ADDR_RE.match(ln)
         if m and not pu_addr:
             blk, _ = take_block(lines, i, m.group(1))
             if blk:
                 pu_lines = blk
                 pu_addr = ", ".join(blk)
+
         m = DEL_ADDR_RE.match(ln)
         if m:
             blk, _ = take_block(lines, i, m.group(1))
@@ -474,6 +521,7 @@ def parse_detailed(text: str) -> Optional[dict]:
 
     if not pu_addr or not dels:
         return None
+
     rate, miles = extract_rate_miles(text)
     meta: Dict[str, Any] = {"rate": rate, "miles": miles}
     if load_num:
@@ -482,8 +530,14 @@ def parse_detailed(text: str) -> Optional[dict]:
         meta["load_date"] = load_date
 
     jid = hashlib.sha1((pu_addr + "|" + "|".join(d["addr"] for d in dels)).encode()).hexdigest()[:10]
-    job = {"id": jid, "meta": meta, "pu": {"addr": pu_addr, "lines": pu_lines or [pu_addr], "time": pu_time}, "del": dels}
+    job = {
+        "id": jid,
+        "meta": meta,
+        "pu": {"addr": pu_addr, "lines": pu_lines or [pu_addr], "time": pu_time},
+        "del": dels,
+    }
     return init_job(job)
+
 
 def parse_summary(text: str) -> Optional[dict]:
     low = text.lower()
@@ -502,10 +556,12 @@ def parse_summary(text: str) -> Optional[dict]:
         if m:
             meta["load_number"] = m.group(1).strip()
             continue
+
         m = LOAD_DATE_RE.match(ln)
         if m:
             load_date = m.group(1).strip()
             continue
+
         m = PICKUP_RE.match(ln)
         if m:
             v = m.group(1).strip()
@@ -514,6 +570,7 @@ def parse_summary(text: str) -> Optional[dict]:
             else:
                 pu_addr = v
             continue
+
         m = DELIVERY_RE.match(ln)
         if m:
             v = m.group(1).strip()
@@ -538,15 +595,25 @@ def parse_summary(text: str) -> Optional[dict]:
         meta["load_date"] = load_date
 
     jid = hashlib.sha1((str(meta.get("load_number", "")) + "|" + pu_addr + "|" + "|".join(d["addr"] for d in dels)).encode()).hexdigest()[:10]
-    job = {"id": jid, "meta": meta, "pu": {"addr": pu_addr, "lines": [pu_addr], "time": pu_time}, "del": dels}
+    job = {
+        "id": jid,
+        "meta": meta,
+        "pu": {"addr": pu_addr, "lines": [pu_addr], "time": pu_time},
+        "del": dels,
+    }
     return init_job(job)
+
 
 def parse_job(text: str) -> Optional[dict]:
     return parse_detailed(text) or parse_summary(text)
 
-# ---------- workflow ----------
+
+# ----------------------------
+# Workflow helpers
+# ----------------------------
 def pu_complete(job: dict) -> bool:
     return bool((job.get("pu") or {}).get("status", {}).get("comp"))
+
 
 def next_incomplete(job: dict, start: int = 0) -> Optional[int]:
     for i, d in enumerate(job.get("del") or []):
@@ -555,6 +622,7 @@ def next_incomplete(job: dict, start: int = 0) -> Optional[int]:
         if not (d.get("status") or {}).get("comp"):
             return i
     return None
+
 
 def focus(job: dict, st: dict) -> Tuple[str, int]:
     if not pu_complete(job):
@@ -570,11 +638,13 @@ def focus(job: dict, st: dict) -> Tuple[str, int]:
             i = ni
     return "DEL", i
 
+
 def load_id_text(job: dict) -> str:
     m = job.get("meta") or {}
     if m.get("load_number"):
         return f"Load {m.get('load_number')}"
-    return f"Job {job.get('id','')}"
+    return f"Job {job.get('id', '')}"
+
 
 def toggle_ts(obj: dict, key: str) -> bool:
     if obj.get(key):
@@ -582,6 +652,7 @@ def toggle_ts(obj: dict, key: str) -> bool:
         return False
     obj[key] = now_iso()
     return True
+
 
 async def send_progress_alert(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     try:
@@ -606,6 +677,7 @@ async def send_progress_alert(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text
 
     asyncio.create_task(_delete_later())
 
+
 def short_place(lines: List[str], addr: str) -> str:
     for x in reversed(lines or []):
         x = (x or "").strip()
@@ -613,12 +685,17 @@ def short_place(lines: List[str], addr: str) -> str:
             return x
     return (addr or "").strip()
 
-# ---------- UI ----------
+
+# ----------------------------
+# UI (buttons)
+# ----------------------------
 def b(label: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=data)
 
+
 def chk(on: bool, label: str) -> str:
     return ("✅ " + label) if on else label
+
 
 def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
     stage, i = focus(job, st)
@@ -629,9 +706,6 @@ def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
     if stage == "PU":
-        rows.append([b(chk(bool(ps["arr"]), "Arrived PU"), "PU:A"),
-                     b(chk(bool(ps["load"]), "Loaded"), "PU:L"),
-                     b(chk(bool(ps["dep"]), "Departed"), "PU:D")])
-        rows.append([b(chk(bool(pd.get("pti")), "PTI"), "DOC:PTI"),
-                     b(chk(bool(pd.get("bol")), "BOL"), "DOC:BOL"),
-                     b(chk(bool(ps["comp"]), "PU Complete"), "PU
+        rows.append(
+            [
+                b(chk(
