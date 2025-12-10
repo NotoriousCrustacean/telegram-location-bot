@@ -612,19 +612,6 @@ def focus(job: dict, st: dict) -> Tuple[str, int]:
     return "DEL", i
 
 
-def short_place(lines: List[str], addr: str) -> str:
-    for x in reversed(lines or []):
-        x = (x or "").strip()
-        if x and len(x) <= 70:
-            return x
-    return (addr or "").strip()
-
-
-def job_title(job: dict) -> str:
-    ln = (job.get("meta") or {}).get("load_number") or ""
-    return f"Load {ln}" if ln else "Load"
-
-
 def load_id_text(job: dict) -> str:
     m = job.get("meta") or {}
     if m.get("load_number"):
@@ -644,8 +631,23 @@ def toggle_ts(obj: dict, key: str) -> bool:
 async def send_progress_alert(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     """Send a minimal progress message; try to auto-delete after ALERT_TTL_SECONDS."""
     try:
-        m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=True)
+        m = await ctx.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            disable_notification=True,
+        )
     except TelegramError:
         return
 
-    if AL
+    if ALERT_TTL_SECONDS <= 0:
+        return
+
+    async def _delete_later() -> None:
+        await asyncio.sleep(ALERT_TTL_SECONDS)
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=m.message_id)
+        except TelegramError:
+            pass
+
+    asyncio.c
