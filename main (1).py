@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 
@@ -33,11 +36,7 @@ from telegram.ext import (
     filters,
 )
 
-from openpyxl import Workbook
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
-
-BOT_VERSION = "2025-12-10_finish_fix_weekly_xlsx"
+BOT_VERSION = "2025-12-10_download_pack_v1"
 
 
 # ----------------------------
@@ -221,12 +220,10 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["hist"] = st.get("history")
         changed = True
 
-    # focus index alias
     if st.get("focus_i") is None and st.get("del_index") is not None:
         st["focus_i"] = st.get("del_index")
         changed = True
 
-    # defaults
     st.setdefault("owner_id", None)
     st.setdefault("allowed_chats", [])
     st.setdefault("last_location", None)
@@ -235,6 +232,7 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
     st.setdefault("geocode_cache", {})
     st.setdefault("history", [])
     st.setdefault("last_finished", None)
+    st.setdefault("panel_messages", {})  # {str(chat_id): msg_id}
 
     # mirror legacy keys
     st["owner"] = st.get("owner_id")
@@ -552,14 +550,14 @@ def parse_detailed(text: str) -> Optional[dict]:
 
         m = PU_ADDR_RE.match(ln)
         if m and not pu_addr:
-            blk, _ = take_block(lines, i=lines.index(ln), first=m.group(1))
+            blk, _ = take_block(lines, i, m.group(1))
             if blk:
                 pu_lines = blk
                 pu_addr = ", ".join(blk)
 
         m = DEL_ADDR_RE.match(ln)
         if m:
-            blk, _ = take_block(lines, i=lines.index(ln), first=m.group(1))
+            blk, _ = take_block(lines, i, m.group(1))
             if blk:
                 dels.append({"addr": ", ".join(blk), "lines": blk, "time": cur_del_time})
 
@@ -699,7 +697,7 @@ def toggle_ts(obj: dict, key: str) -> bool:
 
 
 async def send_progress_alert(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
-    """Short message that auto-deletes (keeps chat clean)."""
+    """Short alert message that auto-deletes (keeps chat clean)."""
     try:
         m = await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_notification=True)
     except TelegramError:
@@ -726,6 +724,9 @@ def short_place(lines: List[str], addr: str) -> str:
     return (addr or "").strip()
 
 
+# ----------------------------
+# Buttons
+# ----------------------------
 def b(label: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=data)
 
@@ -747,8 +748,20 @@ def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
     if stage == "PU":
-        rows.append([b(chk(bool(ps["arr"]), "Arrived PU"), "PU:A"), b(chk(bool(ps["load"]), "Loaded"), "PU:L"), b(chk(bool(ps["dep"]), "Departed"), "PU:D")])
-        rows.append([b(chk(bool(pd.get("pti")), "PTI"), "DOC:PTI"), b(chk(bool(pd.get("bol")), "BOL"), "DOC:BOL"), b(chk(bool(ps["comp"]), "PU Complete"), "PU:C")])
+        rows.append(
+            [
+                b(chk(bool(ps["arr"]), "Arrived PU"), "PU:A"),
+                b(chk(bool(ps["load"]), "Loaded"), "PU:L"),
+                b(chk(bool(ps["dep"]), "Departed"), "PU:D"),
+            ]
+        )
+        rows.append(
+            [
+                b(chk(bool(pd.get("pti")), "PTI"), "DOC:PTI"),
+                b(chk(bool(pd.get("bol")), "BOL"), "DOC:BOL"),
+                b(chk(bool(ps["comp"]), "PU Complete"), "PU:C"),
+            ]
+        )
     else:
         dels = job.get("del") or []
         d = dels[i] if dels else {"addr": "", "lines": []}
@@ -756,17 +769,30 @@ def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
         dd = d.get("docs") or {}
         lbl = f"DEL {i+1}/{len(dels)}" if dels else "DEL"
 
-        rows.append([b(chk(bool(ds.get("arr")), f"Arrived {lbl}"), "DEL:A"), b(chk(bool(ds.get("del")), "Delivered"), "DEL:DL"), b(chk(bool(ds.get("dep")), "Departed"), "DEL:D")])
-        rows.append([b(chk(bool(dd.get("pod")), "POD"), "DOC:POD"), b(chk(bool(ds.get("comp")), "Stop Complete"), "DEL:C"), b("Skip Stop", "DEL:S")])
+        rows.append(
+            [
+                b(chk(bool(ds.get("arr")), f"Arrived {lbl}"), "DEL:A"),
+                b(chk(bool(ds.get("del")), "Delivered"), "DEL:DL"),
+                b(chk(bool(ds.get("dep")), "Departed"), "DEL:D"),
+            ]
+        )
+        rows.append(
+            [
+                b(chk(bool(dd.get("pod")), "POD"), "DOC:POD"),
+                b(chk(bool(ds.get("comp")), "Stop Complete"), "DEL:C"),
+                b("Skip Stop", "DEL:S"),
+            ]
+        )
 
     rows.append([b("ETA", "ETA:A"), b("ETA all", "ETA:ALL")])
     rows.append([b("📊 Catalog", "SHOW:CAT"), b("Finish Load", "JOB:FIN")])
     return InlineKeyboardMarkup(rows)
-    # ----------------------------
-# Finish + Weekly totals
+
+
+# ----------------------------
+# Finish + weekly totals
 # ----------------------------
 def week_totals(hist: List[dict], wk: str) -> Tuple[int, float, float]:
-    """Returns (count, sum_rate, sum_miles_bestguess)."""
     count = 0
     sum_rate = 0.0
     sum_miles = 0.0
@@ -777,7 +803,6 @@ def week_totals(hist: List[dict], wk: str) -> Tuple[int, float, float]:
         rate = r.get("rate")
         if isinstance(rate, (int, float)):
             sum_rate += float(rate)
-        # prefer posted miles, else est miles
         pm = r.get("posted_miles")
         em = r.get("est_miles")
         use = pm if isinstance(pm, (int, float)) else (em if isinstance(em, (int, float)) else None)
@@ -787,12 +812,6 @@ def week_totals(hist: List[dict], wk: str) -> Tuple[int, float, float]:
 
 
 async def finish_active_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, source: str) -> Optional[Tuple[dict, dict]]:
-    """
-    Finishes the current job:
-    - archives it into history
-    - clears active job
-    - returns (record, new_state)
-    """
     async with _state_lock:
         st = load_state()
 
@@ -841,6 +860,8 @@ async def finish_active_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, 
         "est_miles": est,
     }
 
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
     async with _state_lock:
         st2 = load_state()
         hist = list(st2.get("history") or [])
@@ -849,9 +870,13 @@ async def finish_active_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, 
         st2["last_finished"] = rec
         st2["job"] = None
         st2["focus_i"] = 0
+        # clear stored panel message for this chat
+        if chat_id is not None:
+            pm = st2.get("panel_messages") or {}
+            pm.pop(str(chat_id), None)
+            st2["panel_messages"] = pm
         save_state(st2)
 
-    # weekly totals including this record
     count, sum_rate, sum_miles = week_totals(st2.get("history") or [], wk)
     rec["_wk_count"] = count
     rec["_wk_rate"] = sum_rate
@@ -861,7 +886,7 @@ async def finish_active_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, 
 
 
 # ----------------------------
-# Catalog (Excel) - weekly sheets
+# Excel catalog
 # ----------------------------
 def try_parse_date(s: Any) -> Optional[date]:
     if not s:
@@ -879,7 +904,7 @@ def try_parse_dt(s: Any) -> Optional[datetime]:
     if not s:
         return None
     s = str(s).strip()
-    for fmt in ("%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M", "%m/%d/%y %H:%M", "%m-%d-%Y %H:%M", "%Y-%m-%dT%H:%M:%S%z"):
+    for fmt in ("%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M", "%m/%d/%y %H:%M", "%m-%d-%Y %H:%M"):
         try:
             return datetime.strptime(s, fmt)
         except Exception:
@@ -890,7 +915,7 @@ def try_parse_dt(s: Any) -> Optional[datetime]:
         return None
 
 
-def autosize_columns(ws, min_w: int = 10, max_w: int = 55) -> None:
+def autosize_columns(ws, min_w: int = 10, max_w: int = 60) -> None:
     widths: Dict[int, int] = {}
     for row in ws.iter_rows(values_only=True):
         for i, v in enumerate(row, start=1):
@@ -912,8 +937,7 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
 
     records = sorted(records, key=_sort_key)
 
-    title = f"Weekly Loads — {wk}"
-    ws.append([title])
+    ws.append([f"Weekly Loads — {wk}"])
     ws["A1"].font = Font(bold=True, size=14)
 
     headers = [
@@ -942,7 +966,7 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
     for r in records:
         completed_dt = try_parse_dt(r.get("completed")) or try_parse_dt(r.get("completed_utc"))
         load_date = try_parse_date(r.get("load_date"))
-        pu_time = try_parse_dt(r.get("pu_time"))  # may fail; ok
+        pu_time = try_parse_dt(r.get("pu_time"))
 
         rate = r.get("rate")
         posted = r.get("posted_miles")
@@ -978,7 +1002,24 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
             sum_miles += float(use)
 
     ws.append([])
-    ws.append(["TOTAL", "", "", "", "", "", "", "", "", "", sum_rate, "", sum_miles, (sum_rate / sum_miles) if sum_miles else None])
+    ws.append(
+        [
+            "TOTAL",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            sum_rate,
+            "",
+            sum_miles,
+            (sum_rate / sum_miles) if sum_miles else None,
+        ]
+    )
     for c in ws[ws.max_row]:
         c.font = Font(bold=True)
 
@@ -1061,9 +1102,9 @@ async def send_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, from_c
     hist = list(st.get("history") or [])
     if not hist:
         if from_callback and update.callback_query:
-            await update.callback_query.answer("No finished loads yet. Finish a load first.", show_alert=True)
+            await update.callback_query.answer("No finished loads yet.", show_alert=True)
         else:
-            await update.effective_message.reply_text("No finished loads yet. Use /finish when a load is done.")
+            await update.effective_message.reply_text("No finished loads yet. Finish a load first.")
         return
 
     tz_name = ((st.get("last_location") or {}).get("tz")) or "UTC"
@@ -1080,10 +1121,16 @@ async def send_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, from_c
     xlsx, filename = make_xlsx_weekly(records, wk)
     bio = io.BytesIO(xlsx)
     bio.name = filename
+    await ctx.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        filename=filename,
+        caption=f"📊 Catalog ({wk})",
+    )
 
-    await ctx.bot.send_document(chat_id=update.effective_chat.id, document=bio, filename=filename, caption=f"📊 Catalog ({wk})")
-    # ----------------------------
-# Commands
+
+# ----------------------------
+# Telegram commands
 # ----------------------------
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
@@ -1097,7 +1144,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Use: eta / 1717 or /panel\n"
         "Finish: /finish (owner)\n"
         "Catalog: /catalog (owner)\n"
-        "Tools: /leave • /deleteall • /skip\n"
+        "Tools: /skip • /leave • /deleteall\n"
         "Debug: /status • /ping"
     )
 
@@ -1221,22 +1268,32 @@ async def panel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No active load detected yet.")
         return
 
-    await update.effective_message.reply_text(
+    m = await update.effective_message.reply_text(
         f"<b>{h(load_id_text(job))}</b>\nTap buttons to update status.",
         parse_mode="HTML",
         reply_markup=build_keyboard(job, st),
     )
+
+    # remember panel message id for /finish
+    async with _state_lock:
+        st2 = load_state()
+        pm = st2.get("panel_messages") or {}
+        pm[str(update.effective_chat.id)] = int(m.message_id)
+        st2["panel_messages"] = pm
+        save_state(st2)
 
 
 async def finish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     out = await finish_active_load(update, ctx, source="command")
     if not out:
         return
-    rec, _ = out
+    rec, st2 = out
 
-    job_id = rec.get("load_number") or rec.get("job_id") or ""
     rate_txt = money(rec.get("rate") if isinstance(rec.get("rate"), (int, float)) else None)
-    await send_progress_alert(ctx, update.effective_chat.id, f"✅ <b>Finished</b> {h(job_id)} · {h(rate_txt)}")
+    id_txt = rec.get("load_number") or rec.get("job_id") or ""
+
+    # short, auto-deleting notification (keeps chat clean)
+    await send_progress_alert(ctx, update.effective_chat.id, f"✅ <b>Load finished</b> {h(id_txt)} · {h(rate_txt)}")
 
     wk_count = int(rec.get("_wk_count") or 0)
     wk_rate = float(rec.get("_wk_rate") or 0.0)
@@ -1245,11 +1302,25 @@ async def finish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(
         [
             f"✅ <b>Load finished</b>",
-            f"{h(job_id)} · {h(rate_txt)}",
+            f"{h(id_txt)} · {h(rate_txt)}",
             f"Week {h(rec.get('week'))}: {h(wk_count)} loads · {h(money(wk_rate))} · {h(int(round(wk_miles)))} mi",
+            "📊 Tap Catalog for Excel.",
         ]
     )
-    await ctx.bot.send_message(chat_id=update.effective_chat.id, text=report, parse_mode="HTML", reply_markup=build_finished_keyboard())
+
+    # Try to edit the last panel message in this chat (so the buttons disappear)
+    chat_id = update.effective_chat.id
+    pm = (st2.get("panel_messages") or {})
+    msg_id = pm.get(str(chat_id))
+    if msg_id:
+        try:
+            await ctx.bot.edit_message_text(chat_id=chat_id, message_id=int(msg_id), text=report, parse_mode="HTML", reply_markup=build_finished_keyboard())
+            return
+        except TelegramError:
+            pass
+
+    # fallback: send a new compact report with only Catalog button
+    await ctx.bot.send_message(chat_id=chat_id, text=report, parse_mode="HTML", reply_markup=build_finished_keyboard())
 
 
 async def catalog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1335,7 +1406,9 @@ async def send_eta(update: Update, ctx: ContextTypes.DEFAULT_TYPE, which: str):
 
     if which == "ALL":
         lines: List[str] = [f"<b>{h(load_id_text(job))}</b>"]
-        stops: List[Tuple[str, str, List[str], Optional[str]]] = [("PU", job["pu"]["addr"], job["pu"].get("lines") or [], job["pu"].get("time"))]
+        stops: List[Tuple[str, str, List[str], Optional[str]]] = [
+            ("PU", job["pu"]["addr"], job["pu"].get("lines") or [], job["pu"].get("time"))
+        ]
         for j, d in enumerate((job.get("del") or [])[:ETA_ALL_MAX]):
             stops.append((f"D{j+1}", d["addr"], d.get("lines") or [], d.get("time")))
 
@@ -1496,7 +1569,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ <b>Load finished</b>",
                 f"{h(id_txt)} · {h(rate_txt)}",
                 f"Week {h(rec.get('week'))}: {h(wk_count)} loads · {h(money(wk_rate))} · {h(int(round(wk_miles)))} mi",
-                "📊 Use Catalog for Excel.",
+                "📊 Tap Catalog for Excel.",
             ]
         )
 
@@ -1509,6 +1582,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
+    # other progress buttons
     async with _state_lock:
         st2 = load_state()
         job = normalize_job(st2.get("job"))
@@ -1639,6 +1713,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat = update.effective_chat
 
+    # Detect new loads only in allowed groups
     if chat and chat.type in ("group", "supergroup"):
         if chat.id not in set(st.get("allowed_chats") or []):
             return
@@ -1652,6 +1727,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("📦 New load detected. Type eta / 1717 or /panel.")
             return
 
+    # Triggers in allowed chats
     if not chat_allowed(update, st):
         return
 
