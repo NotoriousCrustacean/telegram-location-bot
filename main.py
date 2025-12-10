@@ -405,7 +405,7 @@ async def eta_to(st: dict, origin: Tuple[float, float], label: str, addr: str) -
         return {"ok": True, "m": r[0], "s": r[1], "method": "osrm", "tz": g[2]}
     dist = hav_m(origin[0], origin[1], dest[0], dest[1])
     return {"ok": True, "m": dist, "s": fallback_seconds(dist), "method": "approx", "tz": g[2]}
-    # ----------------------------
+# ----------------------------
 # Load parsing
 # ----------------------------
 RATE_RE = re.compile(r"\b(?:RATE|PAY)\b\s*:\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", re.I)
@@ -748,7 +748,7 @@ def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
     rows.append([b("ETA", "ETA:A"), b("ETA all", "ETA:ALL")])
     rows.append([b("📊 Catalog", "SHOW:CAT"), b("Finish Load", "JOB:FIN")])
     return InlineKeyboardMarkup(rows)
-    # ----------------------------
+# ----------------------------
 # Commands
 # ----------------------------
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1355,4 +1355,161 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             elif data == "DEL:DL":
                 on = toggle_ts(ds, "del")
                 if on:
-                    progress_broadcast = f"📦 <b>Delivered {h(lbl)}</b> — {h(ts)} — {h(load_label)
+                    progress_broadcast = f"📦 <b>Delivered {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+            elif data == "DEL:D":
+                on = toggle_ts(ds, "dep")
+                if on:
+                    progress_broadcast = f"🚚 <b>Departed {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+            elif data == "DEL:C":
+                on = toggle_ts(ds, "comp")
+                if on:
+                    progress_broadcast = f"✅ <b>STOP COMPLETE {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+                    ni = next_incomplete(job, i + 1)
+                    if ni is not None:
+                        st2["focus_i"] = ni
+            elif data == "DEL:S":
+                ds["skip"] = True
+                if not ds.get("comp"):
+                    ds["comp"] = now_iso()
+                progress_broadcast = f"⏭️ <b>SKIPPED {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+                ni = next_incomplete(job, i + 1)
+                if ni is not None:
+                    st2["focus_i"] = ni
+
+            dd["status"] = ds
+            dels[i] = dd
+            job["del"] = dels
+
+        elif data.startswith("DOC:"):
+            if data == "DOC:PTI":
+                job["pu"]["docs"]["pti"] = not bool(job["pu"]["docs"].get("pti"))
+            elif data == "DOC:BOL":
+                job["pu"]["docs"]["bol"] = not bool(job["pu"]["docs"].get("bol"))
+            elif data == "DOC:POD":
+                if stage != "DEL":
+                    await q.answer("Complete PU first.", show_alert=False)
+                    return
+                dels = job.get("del") or []
+                if not dels:
+                    await q.answer("No deliveries.", show_alert=False)
+                    return
+                dels[i].setdefault("docs", {})
+                dels[i]["docs"]["pod"] = not bool(dels[i]["docs"].get("pod"))
+                job["del"] = dels
+
+        st2["job"] = job
+        save_state(st2)
+
+    await q.answer("Updated.", show_alert=False)
+
+    if progress_broadcast:
+        await send_progress_alert(ctx, update.effective_chat.id, progress_broadcast)
+
+    try:
+        await q.edit_message_reply_markup(reply_markup=build_keyboard(job, st2))
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Text handler (new load + triggers)
+# ----------------------------
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+
+    async with _state_lock:
+        st = load_state()
+
+    chat = update.effective_chat
+
+    # Detect new loads only in allowed groups
+    if chat and chat.type in ("group", "supergroup"):
+        if chat.id not in set(st.get("allowed_chats") or []):
+            return
+        job = parse_job(msg.text)
+        if job:
+            async with _state_lock:
+                st2 = load_state()
+                st2["job"] = job
+                st2["focus_i"] = 0
+                save_state(st2)
+            await msg.reply_text("📦 New load detected. Type eta / 1717 or /panel.")
+            return
+
+    # Triggers in allowed chats
+    if not chat_allowed(update, st):
+        return
+
+    parts = msg.text.strip().split()
+    if not parts:
+        return
+
+    first = re.sub(r"^[^\w]+|[^\w]+$", "", parts[0].lower())
+    if first in TRIGGERS:
+        rest = " ".join(parts[1:]).lower()
+        which = "ALL" if "all" in rest else "AUTO"
+        await send_eta(update, ctx, which)
+
+
+# ----------------------------
+# Startup: disable webhook so polling works
+# ----------------------------
+async def _post_init(app):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    try:
+        me = await app.bot.get_me()
+        log(f"Connected as @{me.username} (id {me.id})")
+    except Exception as e:
+        log(f"get_me failed: {e}")
+    log("Ready.")
+
+
+# ----------------------------
+# Main
+# ----------------------------
+def main() -> None:
+    if not TOKEN:
+        raise RuntimeError("Missing TELEGRAM_TOKEN")
+
+    builder = ApplicationBuilder().token(TOKEN)
+    try:
+        builder = builder.post_init(_post_init)
+    except Exception:
+        pass
+
+    app = builder.build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("claim", claim_cmd))
+    app.add_handler(CommandHandler("allowhere", allowhere_cmd))
+    app.add_handler(CommandHandler("update", update_cmd))
+    app.add_handler(CommandHandler("panel", panel_cmd))
+    app.add_handler(CommandHandler("finish", finish_cmd))
+    app.add_handler(CommandHandler("catalog", catalog_cmd))
+    app.add_handler(CommandHandler("deleteall", deleteall_cmd))
+    app.add_handler(CommandHandler("leave", leave_cmd))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
+
+    # Live location updates are edited messages; this handler may not exist in older PTB versions.
+    try:
+        app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, on_location))
+    except Exception:
+        pass
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    log("Starting polling…")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
+
+
+if __name__ == "__main__":
+    main()
