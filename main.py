@@ -36,7 +36,7 @@ from telegram.ext import (
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
-BOT_VERSION = "2025-12-10_full_clean"
+BOT_VERSION = "2025-12-10_rev1"
 
 
 # ----------------------------
@@ -154,6 +154,7 @@ def local_stamp(tz_name: str) -> str:
 def _migrate_state(st: dict) -> Tuple[dict, bool]:
     changed = False
 
+    # owner aliases
     if st.get("owner_id") is None and st.get("owner") is not None:
         st["owner_id"] = st.get("owner")
         changed = True
@@ -161,6 +162,7 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["owner"] = st.get("owner_id")
         changed = True
 
+    # allowed chats aliases
     if (not st.get("allowed_chats")) and st.get("allowed"):
         st["allowed_chats"] = st.get("allowed")
         changed = True
@@ -168,6 +170,7 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["allowed"] = st.get("allowed_chats")
         changed = True
 
+    # last location aliases
     if st.get("last_location") is None and st.get("last") is not None:
         ll = st.get("last") or {}
         st["last_location"] = {
@@ -187,6 +190,7 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         }
         changed = True
 
+    # geocode cache aliases
     if (not st.get("geocode_cache")) and st.get("gc"):
         st["geocode_cache"] = st.get("gc")
         changed = True
@@ -194,6 +198,7 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
         st["gc"] = st.get("geocode_cache")
         changed = True
 
+    # history aliases
     if (not st.get("history")) and st.get("hist"):
         st["history"] = st.get("hist")
         changed = True
@@ -213,6 +218,7 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
     st.setdefault("geocode_cache", {})
     st.setdefault("history", [])
 
+    # mirror legacy keys
     st["owner"] = st.get("owner_id")
     st["allowed"] = st.get("allowed_chats")
     st["gc"] = st.get("geocode_cache")
@@ -317,6 +323,8 @@ def addr_variants(addr: str) -> List[str]:
     out.append(re.sub(r"\b(?:suite|ste|unit|#)\s*[\w\-]+\b", "", a, flags=re.I).strip())
     if len(parts) >= 2:
         out.append(", ".join(parts[-2:]))
+    if "usa" not in a.lower():
+        out.append(a + ", USA")
     seen, res = set(), []
     for x in out:
         x = " ".join(x.split())
@@ -397,9 +405,7 @@ async def eta_to(st: dict, origin: Tuple[float, float], label: str, addr: str) -
         return {"ok": True, "m": r[0], "s": r[1], "method": "osrm", "tz": g[2]}
     dist = hav_m(origin[0], origin[1], dest[0], dest[1])
     return {"ok": True, "m": dist, "s": fallback_seconds(dist), "method": "approx", "tz": g[2]}
-
-
-# ----------------------------
+    # ----------------------------
 # Load parsing
 # ----------------------------
 RATE_RE = re.compile(r"\b(?:RATE|PAY)\b\s*:\s*\$?\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)", re.I)
@@ -609,7 +615,7 @@ def parse_job(text: str) -> Optional[dict]:
 
 
 # ----------------------------
-# Workflow helpers
+# Workflow helpers + UI
 # ----------------------------
 def pu_complete(job: dict) -> bool:
     return bool((job.get("pu") or {}).get("status", {}).get("comp"))
@@ -686,9 +692,6 @@ def short_place(lines: List[str], addr: str) -> str:
     return (addr or "").strip()
 
 
-# ----------------------------
-# UI (buttons)
-# ----------------------------
 def b(label: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=data)
 
@@ -708,4 +711,648 @@ def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
     if stage == "PU":
         rows.append(
             [
-                b(chk(
+                b(chk(bool(ps["arr"]), "Arrived PU"), "PU:A"),
+                b(chk(bool(ps["load"]), "Loaded"), "PU:L"),
+                b(chk(bool(ps["dep"]), "Departed"), "PU:D"),
+            ]
+        )
+        rows.append(
+            [
+                b(chk(bool(pd.get("pti")), "PTI"), "DOC:PTI"),
+                b(chk(bool(pd.get("bol")), "BOL"), "DOC:BOL"),
+                b(chk(bool(ps["comp"]), "PU Complete"), "PU:C"),
+            ]
+        )
+    else:
+        dels = job.get("del") or []
+        d = dels[i] if dels else {"addr": "", "lines": []}
+        ds = d.get("status") or {}
+        dd = d.get("docs") or {}
+        lbl = f"DEL {i+1}/{len(dels)}" if dels else "DEL"
+
+        rows.append(
+            [
+                b(chk(bool(ds.get("arr")), f"Arrived {lbl}"), "DEL:A"),
+                b(chk(bool(ds.get("del")), "Delivered"), "DEL:DL"),
+                b(chk(bool(ds.get("dep")), "Departed"), "DEL:D"),
+            ]
+        )
+        rows.append(
+            [
+                b(chk(bool(dd.get("pod")), "POD"), "DOC:POD"),
+                b(chk(bool(ds.get("comp")), "Stop Complete"), "DEL:C"),
+                b("Skip Stop", "DEL:S"),
+            ]
+        )
+
+    rows.append([b("ETA", "ETA:A"), b("ETA all", "ETA:ALL")])
+    rows.append([b("📊 Catalog", "SHOW:CAT"), b("Finish Load", "JOB:FIN")])
+    return InlineKeyboardMarkup(rows)
+    # ----------------------------
+# Commands
+# ----------------------------
+async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        f"Dispatch Bot ({BOT_VERSION})\n"
+        f"Triggers: {', '.join(sorted(TRIGGERS))}\n\n"
+        "DM setup:\n"
+        "1) /claim <code>\n"
+        "2) /update (send location)\n\n"
+        "Group setup:\n"
+        "3) /allowhere (in the group)\n\n"
+        "Use: eta / 1717 or /panel\n"
+        "Catalog: /finish • /catalog\n"
+        "Tools: /leave • /deleteall\n"
+        "Debug: /status • /ping"
+    )
+
+
+async def ping_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(f"pong ✅ ({BOT_VERSION})")
+
+
+async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+
+    uid = update.effective_user.id if update.effective_user else None
+    allowed_here = chat_allowed(update, st)
+    loc = st.get("last_location")
+    job = normalize_job(st.get("job"))
+
+    lines = [
+        f"<b>Status</b> ({h(BOT_VERSION)})",
+        f"<b>Your user id:</b> {h(uid)}",
+        f"<b>Owner id:</b> {h(st.get('owner_id'))}",
+        f"<b>This chat allowed:</b> {h(allowed_here)}",
+        f"<b>Allowed chats:</b> {h(len(st.get('allowed_chats') or []))}",
+        f"<b>State file:</b> {h(str(STATE_FILE))}",
+        f"<b>Location saved:</b> {'✅' if loc else '❌'}",
+        f"<b>Active load:</b> {'✅' if job else '❌'}",
+    ]
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def claim_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("DM me: /claim <code>")
+        return
+    if not CLAIM_CODE:
+        await update.effective_message.reply_text("CLAIM_CODE is missing in Railway Variables.")
+        return
+
+    code = " ".join(ctx.args or []).strip()
+    if code != CLAIM_CODE:
+        await update.effective_message.reply_text("❌ Wrong claim code.")
+        return
+
+    async with _state_lock:
+        st = load_state()
+        st["owner_id"] = update.effective_user.id
+        save_state(st)
+
+    await update.effective_message.reply_text("✅ Owner set. Now send /update to save your location.")
+
+
+async def allowhere_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only. DM /claim <code> first.")
+            return
+
+        chat = update.effective_chat
+        if chat.type == "private":
+            await update.effective_message.reply_text("Run /allowhere inside the group you want to allow.")
+            return
+
+        allowed = set(st.get("allowed_chats") or [])
+        allowed.add(chat.id)
+        st["allowed_chats"] = sorted(list(allowed))
+        save_state(st)
+
+    await update.effective_message.reply_text("✅ Group allowed.")
+
+
+async def update_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only. DM /claim <code> first.")
+            return
+
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("Please DM me /update (best).")
+        return
+
+    kb = [[KeyboardButton("📍 Send my current location", request_location=True)]]
+    await update.effective_message.reply_text(
+        "Tap to send your location.\n"
+        "Tip: Attach → Location → Share Live Location for ongoing updates.",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True),
+    )
+
+
+async def on_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.location:
+        return
+
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            return
+        lat, lon = msg.location.latitude, msg.location.longitude
+        tz = TF.timezone_at(lat=lat, lng=lon) or "UTC"
+        st["last_location"] = {"lat": lat, "lon": lon, "tz": tz, "updated_at": now_iso()}
+        save_state(st)
+
+    if update.effective_chat.type == "private":
+        await msg.reply_text("✅ Location saved.", reply_markup=ReplyKeyboardRemove())
+
+
+async def panel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+
+    if not chat_allowed(update, st):
+        if update.effective_chat.type != "private":
+            await update.effective_message.reply_text("This chat isn't allowed yet. Owner: run /allowhere here.")
+        return
+
+    job = normalize_job(st.get("job"))
+    if not job:
+        await update.effective_message.reply_text("No active load detected yet.")
+        return
+
+    await update.effective_message.reply_text(
+        f"<b>{h(load_id_text(job))}</b>\nTap buttons to update status.",
+        parse_mode="HTML",
+        reply_markup=build_keyboard(job, st),
+    )
+
+
+# ----------------------------
+# ETA
+# ----------------------------
+async def send_eta(update: Update, ctx: ContextTypes.DEFAULT_TYPE, which: str):
+    async with _state_lock:
+        st = load_state()
+
+    if not chat_allowed(update, st):
+        return
+
+    loc = st.get("last_location")
+    if not loc:
+        await update.effective_message.reply_text("No saved location yet. Owner: DM /update.")
+        return
+
+    origin = (float(loc["lat"]), float(loc["lon"]))
+    tz_now = loc.get("tz") or "UTC"
+    tz = safe_tz(tz_now)
+
+    await ctx.bot.send_location(chat_id=update.effective_chat.id, latitude=origin[0], longitude=origin[1])
+
+    job = normalize_job(st.get("job"))
+    if not job:
+        await update.effective_message.reply_text(
+            f"<b>⏱ ETA</b>\nNow: {h(datetime.now(tz).strftime('%Y-%m-%d %H:%M'))} ({h(tz_now)})\n\n<i>No active load yet.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    which = (which or "AUTO").upper()
+
+    if which == "ALL":
+        lines: List[str] = [f"<b>{h(load_id_text(job))}</b>"]
+        stops: List[Tuple[str, str, List[str], Optional[str]]] = [
+            ("PU", job["pu"]["addr"], job["pu"].get("lines") or [], job["pu"].get("time"))
+        ]
+        for j, d in enumerate((job.get("del") or [])[:ETA_ALL_MAX]):
+            stops.append((f"D{j+1}", d["addr"], d.get("lines") or [], d.get("time")))
+
+        for lab, addr, lines2, appt in stops:
+            r = await eta_to(st, origin, lab, addr)
+            place = short_place(lines2, addr)
+            if r.get("ok"):
+                arr = (now_utc().astimezone(tz) + timedelta(seconds=float(r["s"]))).strftime("%H:%M")
+                tag = " (approx)" if r.get("method") == "approx" else ""
+                appt_txt = f" · Appt: {appt}" if appt else ""
+                lines.append(
+                    f"<b>{h(lab)}:</b> <b>{h(fmt_dur(r['s']))}</b>{h(tag)} · {h(fmt_mi(r['m']))} · ~{h(arr)}{h(appt_txt)} — {h(place)}"
+                )
+            else:
+                lines.append(f"<b>{h(lab)}:</b> ⚠️ {h(r.get('err'))} — {h(place)}")
+
+        await update.effective_message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=build_keyboard(job, st),
+        )
+        return
+
+    stage, i = focus(job, st)
+    if stage == "PU":
+        addr = job["pu"]["addr"]
+        lines2 = job["pu"].get("lines") or []
+        appt = job["pu"].get("time")
+        stop_label = "PU"
+        label = "Pickup"
+    else:
+        dels = job.get("del") or []
+        d = dels[i] if dels else {"addr": "", "lines": [], "time": None}
+        addr = d["addr"]
+        lines2 = d.get("lines") or []
+        appt = d.get("time")
+        stop_label = f"DEL {i+1}/{len(dels)}" if dels else "DEL"
+        label = f"Delivery {i+1}/{len(dels)}"
+
+    r = await eta_to(st, origin, label, addr)
+    place = short_place(lines2, addr)
+
+    if r.get("ok"):
+        arr = (now_utc().astimezone(tz) + timedelta(seconds=float(r["s"]))).strftime("%H:%M")
+        tag = " (approx)" if r.get("method") == "approx" else ""
+        out = [
+            f"<b>⏱ ETA: {h(fmt_dur(r['s']))}</b>{h(tag)} — {h(stop_label)}",
+            f"{h(load_id_text(job))} · {h(place)}",
+            f"Arrive ~ {h(arr)} ({h(tz_now)}) · {h(fmt_mi(r['m']))}",
+        ]
+        if appt:
+            out.append(f"Appt: {h(appt)}")
+        await update.effective_message.reply_text(
+            "\n".join(out),
+            parse_mode="HTML",
+            reply_markup=build_keyboard(job, st),
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"<b>{h(load_id_text(job))}</b>\n<b>⏱ ETA:</b> ⚠️ {h(r.get('err'))}\n<b>Target:</b> {h(place)}",
+            parse_mode="HTML",
+            reply_markup=build_keyboard(job, st),
+        )
+
+
+# ----------------------------
+# Catalog (Excel)
+# ----------------------------
+def week_key(dt: datetime) -> str:
+    iso = dt.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+async def estimate_miles(st: dict, job: dict) -> Optional[float]:
+    addrs = [job["pu"]["addr"]] + [d["addr"] for d in (job.get("del") or [])]
+    coords: List[Tuple[float, float]] = []
+    for a in addrs:
+        g = await geocode_cached(st, a)
+        if not g:
+            return None
+        coords.append((g[0], g[1]))
+    if len(coords) < 2:
+        return 0.0
+    total_m = 0.0
+    for a, b_ in zip(coords, coords[1:]):
+        r = await route(a, b_)
+        total_m += r[0] if r else hav_m(a[0], a[1], b_[0], b_[1])
+    return total_m / 1609.344
+
+
+def make_xlsx(records: List[dict], title: str) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Loads"
+
+    ws.append([title])
+    ws["A1"].font = Font(bold=True, size=14)
+
+    headers = [
+        "Week",
+        "Completed",
+        "Load #",
+        "Job ID",
+        "Load Date",
+        "PU Time",
+        "PU Location",
+        "DEL Times",
+        "DEL Locations",
+        "Rate",
+        "Posted Miles",
+        "Est Miles",
+        "Rate/EstMi",
+    ]
+    ws.append(headers)
+    for c in ws[2]:
+        c.font = Font(bold=True)
+
+    total_rate = 0.0
+    total_est = 0.0
+
+    for r in records:
+        rate = r.get("rate")
+        est_mi = r.get("est_miles")
+        rpm = None
+        if rate is not None and est_mi:
+            try:
+                rpm = float(rate) / float(est_mi)
+            except Exception:
+                rpm = None
+
+        ws.append(
+            [
+                r.get("week"),
+                r.get("completed"),
+                r.get("load_number"),
+                r.get("job_id"),
+                r.get("load_date"),
+                r.get("pu_time"),
+                r.get("pickup"),
+                r.get("del_times"),
+                r.get("deliveries"),
+                rate,
+                r.get("posted_miles"),
+                est_mi,
+                rpm,
+            ]
+        )
+
+        if rate is not None:
+            total_rate += float(rate)
+        if est_mi is not None:
+            total_est += float(est_mi)
+
+    ws.append([])
+    ws.append(
+        [
+            "TOTAL",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            total_rate,
+            "",
+            total_est,
+            (total_rate / total_est) if total_est else None,
+        ]
+    )
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+async def finish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+        job = normalize_job(st.get("job"))
+        if not job:
+            await update.effective_message.reply_text("No active load.")
+            return
+
+    loc = st.get("last_location") or {}
+    tz_name = loc.get("tz") or "UTC"
+    dt_local = now_utc().astimezone(safe_tz(tz_name))
+    wk = week_key(dt_local)
+
+    meta = job.get("meta") or {}
+    est = await estimate_miles(st, job)
+
+    pu = job["pu"]
+    dels = job.get("del") or []
+    del_times = " | ".join(((d.get("time") or "").strip() or "-") for d in dels)
+
+    rec = {
+        "week": wk,
+        "completed": dt_local.strftime("%Y-%m-%d %H:%M"),
+        "load_number": meta.get("load_number") or "",
+        "job_id": job.get("id"),
+        "load_date": meta.get("load_date"),
+        "pu_time": pu.get("time"),
+        "pickup": (pu.get("addr") or ""),
+        "deliveries": " | ".join((d.get("addr") or "") for d in dels),
+        "del_times": del_times,
+        "rate": meta.get("rate"),
+        "posted_miles": meta.get("miles"),
+        "est_miles": est,
+    }
+
+    async with _state_lock:
+        st2 = load_state()
+        hist = list(st2.get("history") or [])
+        hist.append(rec)
+        st2["history"] = hist[-600:]
+        st2["job"] = None
+        st2["focus_i"] = 0
+        save_state(st2)
+
+    await update.effective_message.reply_text("✅ Load archived + cleared.")
+
+
+async def catalog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+        if not chat_allowed(update, st):
+            await update.effective_message.reply_text("Run /catalog in an allowed chat (or DM as owner).")
+            return
+        hist = list(st.get("history") or [])
+        loc = st.get("last_location") or {}
+        tz_name = loc.get("tz") or "UTC"
+
+    if not hist:
+        await update.effective_message.reply_text("No finished loads yet. Use /finish when a load is done.")
+        return
+
+    wk = week_key(now_utc().astimezone(safe_tz(tz_name)))
+
+    if ctx.args:
+        a = ctx.args[0].strip().lower()
+        if a == "all":
+            wk = "ALL"
+        elif re.fullmatch(r"\d{4}-w\d{2}", a):
+            wk = a.upper().replace("w", "W")
+        elif a in ("last", "prev"):
+            wk = week_key(now_utc().astimezone(safe_tz(tz_name)) - timedelta(days=7))
+
+    records = hist if wk == "ALL" else [r for r in hist if r.get("week") == wk]
+    if not records:
+        await update.effective_message.reply_text("No records for that week.")
+        return
+
+    title = f"Weekly Load Catalog ({wk})" if wk != "ALL" else "Load Catalog (ALL)"
+    xlsx = make_xlsx(records, title)
+
+    bio = io.BytesIO(xlsx)
+    bio.name = f"load_catalog_{wk}.xlsx"
+    await ctx.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        filename=bio.name,
+        caption=title,
+    )
+
+
+# ----------------------------
+# Admin tools
+# ----------------------------
+async def deleteall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.effective_message.reply_text("Bots can't clear a DM history. Delete the chat from your side.")
+        return
+
+    n = DELETEALL_DEFAULT
+    if ctx.args:
+        try:
+            n = max(1, min(2000, int(ctx.args[0])))
+        except ValueError:
+            pass
+
+    notice = await update.effective_message.reply_text(f"🧹 Deleting up to {n} messages… (bot must be admin)")
+    start_id = notice.message_id
+
+    for mid in range(start_id, max(1, start_id - n + 1) - 1, -1):
+        try:
+            await ctx.bot.delete_message(chat_id=chat.id, message_id=mid)
+        except (Forbidden, BadRequest):
+            break
+        await asyncio.sleep(0.02)
+
+
+async def leave_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+
+        chat = update.effective_chat
+        if not chat or chat.type == "private":
+            await update.effective_message.reply_text("Run /leave inside the group you want the bot to leave.")
+            return
+
+        allowed = set(st.get("allowed_chats") or [])
+        allowed.discard(chat.id)
+        st["allowed_chats"] = sorted(list(allowed))
+        save_state(st)
+
+    await update.effective_message.reply_text("👋 Leaving this chat…")
+    try:
+        await ctx.bot.leave_chat(chat.id)
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Callback handler
+# ----------------------------
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+
+    data = q.data
+
+    async with _state_lock:
+        st = load_state()
+
+    if not chat_allowed(update, st):
+        await q.answer("Not allowed here.", show_alert=False)
+        return
+
+    if data.startswith("ETA:"):
+        await q.answer("Computing ETA…", show_alert=False)
+        await send_eta(update, ctx, data.split(":", 1)[1])
+        return
+
+    if data == "SHOW:CAT":
+        if not is_owner(update, st):
+            await q.answer("Owner only.", show_alert=False)
+            return
+        await q.answer("Building catalog…", show_alert=False)
+        await catalog_cmd(update, ctx)
+        return
+
+    if data == "JOB:FIN":
+        if not is_owner(update, st):
+            await q.answer("Owner only.", show_alert=False)
+            return
+        await q.answer("Finishing load…", show_alert=False)
+        await finish_cmd(update, ctx)
+        return
+
+    progress_broadcast: Optional[str] = None
+
+    async with _state_lock:
+        st2 = load_state()
+        job = normalize_job(st2.get("job"))
+        if not job:
+            await q.answer("No active load.", show_alert=False)
+            return
+
+        stage, i = focus(job, st2)
+        tz_name = ((st2.get("last_location") or {}).get("tz")) or "UTC"
+        ts = local_stamp(tz_name)
+        load_label = load_id_text(job)
+
+        if data.startswith("PU:"):
+            ps = job["pu"]["status"]
+            if data == "PU:A":
+                on = toggle_ts(ps, "arr")
+                if on:
+                    progress_broadcast = f"📍 <b>PU Arrived</b> — {h(ts)} — {h(load_label)}"
+            elif data == "PU:L":
+                on = toggle_ts(ps, "load")
+                if on:
+                    progress_broadcast = f"📦 <b>Loaded</b> — {h(ts)} — {h(load_label)}"
+            elif data == "PU:D":
+                on = toggle_ts(ps, "dep")
+                if on:
+                    progress_broadcast = f"🚚 <b>Departed PU</b> — {h(ts)} — {h(load_label)}"
+            elif data == "PU:C":
+                on = toggle_ts(ps, "comp")
+                if on:
+                    progress_broadcast = f"✅ <b>PU COMPLETE</b> — {h(ts)} — {h(load_label)}"
+                    ni = next_incomplete(job, 0)
+                    if ni is not None:
+                        st2["focus_i"] = ni
+
+        elif data.startswith("DEL:"):
+            if stage != "DEL":
+                await q.answer("Complete PU first.", show_alert=False)
+                return
+
+            dels = job.get("del") or []
+            if not dels:
+                await q.answer("No deliveries.", show_alert=False)
+                return
+
+            dd = dels[i]
+            ds = dd.get("status") or {}
+            lbl = f"DEL {i+1}/{len(dels)}"
+
+            if data == "DEL:A":
+                on = toggle_ts(ds, "arr")
+                if on:
+                    progress_broadcast = f"📍 <b>Arrived {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+            elif data == "DEL:DL":
+                on = toggle_ts(ds, "del")
+                if on:
+                    progress_broadcast = f"📦 <b>Delivered {h(lbl)}</b> — {h(ts)} — {h(load_label)
