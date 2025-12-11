@@ -3032,16 +3032,20 @@ async def reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
                             alerts.append((key, build_alert_message("⏰", f"{lbl} DEADLINE IN ~{int(mins)}m", "", "")))
         
         if alerts:
+            # First, update state
             async with _state_lock:
                 st = load_state()
                 sent = st.setdefault("reminders_sent", {})
                 for key, msg in alerts:
                     sent[key] = True
-                    for chat_id in chats:
-                        try:
-                            await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
-                        except: pass
                 save_state(st)
+            
+            # Then send messages (outside the lock)
+            for key, msg in alerts:
+                for chat_id in chats:
+                    try:
+                        await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
+                    except: pass
         
         # Check for detention alerts
         await check_detention_alerts(ctx, st, job, chats)
@@ -3076,17 +3080,21 @@ async def check_detention_alerts(ctx: ContextTypes.DEFAULT_TYPE, st: dict, job: 
                     alerts.append((key, lbl, det))
     
     if alerts:
+        # First, update state
         async with _state_lock:
             st = load_state()
             sent = st.setdefault("reminders_sent", {})
             for key, stop_name, det in alerts:
                 sent[key] = True
-                msg = build_detention_alert(stop_name, det)
-                for chat_id in chats:
-                    try:
-                        await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
-                    except: pass
             save_state(st)
+        
+        # Then send messages (outside the lock)
+        for key, stop_name, det in alerts:
+            msg = build_detention_alert(stop_name, det)
+            for chat_id in chats:
+                try:
+                    await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
+                except: pass
 
 def parse_appt_time(time_str: str, tz_name: str) -> Optional[datetime]:
     if not time_str:
@@ -3156,6 +3164,8 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
                     gf_state[key] = is_in
         
         if events:
+            # First, update state
+            messages_to_send = []
             async with _state_lock:
                 st = load_state()
                 job = get_job(st)
@@ -3180,15 +3190,19 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
                             if idx < len(job.get("del", [])):
                                 job["del"][idx].setdefault("status", {})["dep"] = now_iso()
                     
-                    for chat_id in chats:
-                        try:
-                            await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
-                        except: pass
+                    messages_to_send.append(msg)
                 
                 st["job"] = job
                 st["geofence_state"] = gf_state
                 st["geocode_cache"] = cache
                 save_state(st)
+            
+            # Then send messages (outside the lock)
+            for msg in messages_to_send:
+                for chat_id in chats:
+                    try:
+                        await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
+                    except: pass
     except Exception as e:
         log_error("Geofence job", e)
 
