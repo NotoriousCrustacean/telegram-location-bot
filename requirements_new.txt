@@ -1,0 +1,14 @@
+# Trucker Dispatch Bot Requirements
+# Python 3.9+ required (for zoneinfo module)
+
+# Telegram Bot Framework with JobQueue support
+python-telegram-bot[job-queue]==21.6
+
+# Async HTTP client for geocoding (Nominatim) and routing (OSRM)
+httpx==0.27.2
+
+# Timezone detection from GPS coordinates
+timezonefinder==6.5.2
+
+# Excel file generation for load catalogs
+openpyxl==3.1.5
