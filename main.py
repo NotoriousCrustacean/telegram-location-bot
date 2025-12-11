@@ -1,12 +1,12 @@
 """
 Telegram Trucker Dispatch Assistant Bot
-Version: 2025-12-11_v4 (Multi-Geocoder Edition)
+Version: 2025-12-11_v5 (Beautiful Edition)
 
 Features:
-- Multiple geocoding services (Nominatim + Photon fallback)
-- Enhanced address parsing and normalization
-- Detailed debug logging
-- Fixed deleteall command
+- Enhanced visual design with better formatting
+- Cleaner UI with improved emoji usage
+- Professional status displays
+- Better organized information hierarchy
 """
 
 import asyncio
@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 import httpx
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 
@@ -48,7 +48,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "2025-12-11_v4"
+BOT_VERSION = "5.0"
 
 # ============================================================================
 # CONFIGURATION
@@ -119,7 +119,6 @@ def log_error(msg: str, exc: Exception = None):
 # ============================================================================
 TF = TimezoneFinder()
 
-# Multiple geocoding endpoints for fallback
 GEOCODE_SERVICES = [
     {
         "name": "Nominatim",
@@ -148,6 +147,31 @@ _tasks: Set[asyncio.Task] = set()
 METERS_PER_MILE = 1609.344
 
 # ============================================================================
+# VISUAL DESIGN CONSTANTS
+# ============================================================================
+# Box drawing characters for clean layouts
+LINE = "─" * 24
+DIVIDER = "┄" * 24
+
+# Status indicators
+ICON_SUCCESS = "✅"
+ICON_PENDING = "○"
+ICON_ACTIVE = "◉"
+ICON_WARNING = "⚠️"
+ICON_ERROR = "❌"
+ICON_TRUCK = "🚛"
+ICON_PICKUP = "📦"
+ICON_DELIVERY = "🏁"
+ICON_CLOCK = "🕐"
+ICON_MONEY = "💵"
+ICON_MILES = "🛣"
+ICON_LOCATION = "📍"
+ICON_NAV = "🧭"
+ICON_DOC = "📋"
+ICON_FUEL = "⛽"
+ICON_CALENDAR = "📅"
+
+# ============================================================================
 # HELPERS
 # ============================================================================
 def now_utc() -> datetime:
@@ -164,24 +188,43 @@ def h(x: Any) -> str:
     return html.escape(str(x) if x is not None else "", quote=False)
 
 def money(x) -> str:
-    try: return f"${float(x):,.0f}" if x is not None else "-"
-    except: return str(x) if x else "-"
+    try: 
+        val = float(x)
+        if val >= 1000:
+            return f"${val:,.0f}"
+        return f"${val:.0f}"
+    except: 
+        return "—"
 
 def fmt_dur(secs: float) -> str:
     secs = max(0, int(secs))
     hours, mins = divmod(secs // 60, 60)
-    return f"{hours}h {mins}m" if hours else f"{mins}m"
+    if hours > 0:
+        return f"{hours}h {mins:02d}m"
+    return f"{mins}m"
 
 def fmt_mi(meters: float) -> str:
     mi = meters / METERS_PER_MILE
-    return f"{mi:.1f} mi" if mi < 10 else f"{mi:.0f} mi"
+    if mi < 10:
+        return f"{mi:.1f} mi"
+    return f"{int(mi)} mi"
 
 def week_key(dt: datetime) -> str:
     iso = dt.isocalendar()
     return f"{iso.year}-W{iso.week:02d}"
 
 def local_stamp(tz_name: str) -> str:
-    return now_utc().astimezone(safe_tz(tz_name)).strftime("%Y-%m-%d %H:%M")
+    return now_utc().astimezone(safe_tz(tz_name)).strftime("%I:%M %p")
+
+def local_date(tz_name: str) -> str:
+    return now_utc().astimezone(safe_tz(tz_name)).strftime("%b %d")
+
+def progress_bar(current: int, total: int, width: int = 10) -> str:
+    """Create a visual progress bar."""
+    if total == 0:
+        return "░" * width
+    filled = int((current / total) * width)
+    return "▓" * filled + "░" * (width - filled)
 
 # ============================================================================
 # STATE MANAGEMENT
@@ -225,21 +268,15 @@ def get_broadcast_chats(st: dict) -> List[int]:
 # ADDRESS NORMALIZATION
 # ============================================================================
 def normalize_address(addr: str) -> str:
-    """Normalize address for better geocoding."""
     if not addr:
         return ""
     
-    # Uppercase for consistency
     result = addr.upper().strip()
     
-    # Remove company names / labels before the actual address
-    # Pattern: "COMPANY NAME, 123 Street..." or "COMPANY NAME - 123 Street..."
-    # Keep everything from the first number onward
     num_match = re.search(r'(\d+\s+.+)', result)
     if num_match:
         result = num_match.group(1)
     
-    # Normalize street types
     replacements = [
         (r'\bSTREET\b', 'ST'),
         (r'\bAVENUE\b', 'AVE'),
@@ -262,7 +299,6 @@ def normalize_address(addr: str) -> str:
     for pattern, repl in replacements:
         result = re.sub(pattern, repl, result)
     
-    # Clean up multiple spaces/commas
     result = re.sub(r'\s+', ' ', result)
     result = re.sub(r',\s*,', ',', result)
     result = result.strip(' ,')
@@ -270,7 +306,6 @@ def normalize_address(addr: str) -> str:
     return result
 
 def extract_address_components(addr: str) -> dict:
-    """Extract street, city, state, zip from address."""
     components = {
         "street": None,
         "city": None,
@@ -282,27 +317,22 @@ def extract_address_components(addr: str) -> dict:
     if not addr:
         return components
     
-    # Find ZIP code
     zip_match = re.search(r'\b(\d{5})(?:-\d{4})?\b', addr)
     if zip_match:
         components["zip"] = zip_match.group(1)
     
-    # Find state (2-letter code)
     state_match = re.search(r'\b([A-Z]{2})\b(?:\s+\d{5})?(?:\s*,?\s*(?:USA|US)?)?$', addr.upper())
     if state_match:
         components["state"] = state_match.group(1)
     
-    # Find street number + name
     street_match = re.search(r'(\d+\s+[^,]+?)(?:,|\s+[A-Z]{2}\b)', addr, re.I)
     if street_match:
         components["street"] = street_match.group(1).strip()
     
-    # Find city (usually before state)
     if components["state"]:
         city_match = re.search(r'([A-Za-z\s]+),?\s*' + components["state"], addr, re.I)
         if city_match:
             city = city_match.group(1).strip()
-            # Make sure it's not the street
             if city and components["street"] and city not in components["street"]:
                 components["city"] = city
             elif city and not components["street"]:
@@ -311,26 +341,20 @@ def extract_address_components(addr: str) -> dict:
     return components
 
 def generate_address_variants(addr: str) -> List[str]:
-    """Generate multiple address variants for geocoding attempts."""
     if not addr:
         return []
     
     variants = []
     
-    # Normalize the address first
     normalized = normalize_address(addr)
     components = extract_address_components(normalized)
     
     log_debug(f"Address components: {components}")
     
-    # Build variants from most specific to least
-    
-    # 1. Full normalized address
     if normalized:
         variants.append(normalized)
         variants.append(f"{normalized}, USA")
     
-    # 2. Street + City + State + ZIP
     if all([components["street"], components["city"], components["state"]]):
         full = f"{components['street']}, {components['city']}, {components['state']}"
         variants.append(full)
@@ -338,25 +362,20 @@ def generate_address_variants(addr: str) -> List[str]:
         if components["zip"]:
             variants.append(f"{full} {components['zip']}")
     
-    # 3. Street + City + State (without zip)
     if components["street"] and components["state"]:
         variants.append(f"{components['street']}, {components['state']}")
         variants.append(f"{components['street']}, {components['state']}, USA")
     
-    # 4. City + State
     if components["city"] and components["state"]:
         variants.append(f"{components['city']}, {components['state']}")
         variants.append(f"{components['city']}, {components['state']}, USA")
     
-    # 5. ZIP code alone (very reliable)
     if components["zip"]:
         variants.append(components["zip"])
     
-    # 6. Try original with USA
     if addr and "USA" not in addr.upper():
         variants.append(f"{addr}, USA")
     
-    # Remove duplicates while preserving order
     seen = set()
     unique = []
     for v in variants:
@@ -367,13 +386,11 @@ def generate_address_variants(addr: str) -> List[str]:
             unique.append(v_clean)
     
     log_debug(f"Generated {len(unique)} address variants")
-    for i, v in enumerate(unique[:5]):
-        log_debug(f"  Variant {i+1}: {v}")
     
     return unique
 
 # ============================================================================
-# MULTI-SERVICE GEOCODING
+# GEOCODING
 # ============================================================================
 def haversine_miles(lat1, lon1, lat2, lon2) -> float:
     R = 3958.8
@@ -386,7 +403,6 @@ def haversine_meters(lat1, lon1, lat2, lon2) -> float:
     return haversine_miles(lat1, lon1, lat2, lon2) * METERS_PER_MILE
 
 async def geocode_with_service(client: httpx.AsyncClient, service: dict, query: str) -> Optional[Tuple[float, float]]:
-    """Try geocoding with a specific service."""
     try:
         r = await client.get(service["url"], params=service["params"](query))
         log_debug(f"  {service['name']}: HTTP {r.status_code}")
@@ -397,12 +413,8 @@ async def geocode_with_service(client: httpx.AsyncClient, service: dict, query: 
             if result:
                 log_debug(f"  {service['name']}: Found {result[0]:.4f}, {result[1]:.4f}")
                 return result
-            else:
-                log_debug(f"  {service['name']}: No results in response")
         elif r.status_code == 429:
-            log(f"  {service['name']}: Rate limited (429)")
-        else:
-            log_debug(f"  {service['name']}: HTTP {r.status_code}")
+            log(f"  {service['name']}: Rate limited")
             
     except httpx.TimeoutException:
         log(f"  {service['name']}: Timeout")
@@ -412,21 +424,16 @@ async def geocode_with_service(client: httpx.AsyncClient, service: dict, query: 
     return None
 
 async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
-    """Geocode with multiple services and fallbacks."""
     if not addr:
-        log_debug("Geocode: Empty address")
         return None
     
-    # Check cache first
     cache_key = addr.lower().strip()
     if cache_key in cache:
         c = cache[cache_key]
-        log_debug(f"Geocode: Cache hit")
         return c["lat"], c["lon"], c.get("tz", "UTC")
     
     variants = generate_address_variants(addr)
     if not variants:
-        log("Geocode: No variants generated")
         return None
     
     headers = {
@@ -435,10 +442,9 @@ async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
     }
     
     async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
-        for variant in variants[:6]:  # Try up to 6 variants
+        for variant in variants[:6]:
             log_debug(f"Geocode trying: {variant}")
             
-            # Rate limiting
             async with _geo_lock:
                 global _geo_last
                 wait = _geo_last + NOMINATIM_MIN_INTERVAL - time.monotonic()
@@ -446,28 +452,22 @@ async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
                     await asyncio.sleep(wait)
                 _geo_last = time.monotonic()
             
-            # Try each geocoding service
             for service in GEOCODE_SERVICES:
                 result = await geocode_with_service(client, service, variant)
                 
                 if result:
                     lat, lon = result
                     tz = TF.timezone_at(lat=lat, lng=lon) or "UTC"
-                    
-                    # Cache the result
                     cache[cache_key] = {"lat": lat, "lon": lon, "tz": tz}
-                    
-                    log(f"Geocode SUCCESS via {service['name']}: {lat:.4f}, {lon:.4f}")
+                    log(f"Geocode SUCCESS: {lat:.4f}, {lon:.4f}")
                     return lat, lon, tz
                 
-                # Small delay between services
                 await asyncio.sleep(0.3)
     
-    log(f"Geocode FAILED: All variants and services exhausted for '{addr[:40]}'")
+    log(f"Geocode FAILED: '{addr[:40]}'")
     return None
 
 async def get_route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optional[Tuple[float, float]]:
-    """Get driving route from OSRM."""
     url = OSRM_URL.format(lat1=origin[0], lon1=origin[1], lat2=dest[0], lon2=dest[1])
     
     try:
@@ -477,7 +477,6 @@ async def get_route(origin: Tuple[float, float], dest: Tuple[float, float]) -> O
                 data = r.json()
                 if data.get("code") == "Ok" and data.get("routes"):
                     rt = data["routes"][0]
-                    log_debug(f"Route: {rt['distance']/1609:.1f} mi, {rt['duration']/60:.0f} min")
                     return rt["distance"], rt["duration"]
     except Exception as e:
         log_error("Route error", e)
@@ -485,7 +484,6 @@ async def get_route(origin: Tuple[float, float], dest: Tuple[float, float]) -> O
     return None
 
 async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
-    """Calculate ETA to address."""
     if not addr:
         return {"ok": False, "err": "No address"}
     
@@ -493,7 +491,7 @@ async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
     geo = await geocode(addr, cache)
     
     if not geo:
-        return {"ok": False, "err": f"Could not locate address"}
+        return {"ok": False, "err": f"Location not found"}
     
     dest = (geo[0], geo[1])
     route = await get_route(origin, dest)
@@ -507,7 +505,6 @@ async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
             "method": "route",
         }
     
-    # Fallback to haversine
     dist_m = haversine_meters(origin[0], origin[1], dest[0], dest[1])
     dist_mi = dist_m / METERS_PER_MILE
     
@@ -533,8 +530,194 @@ DEL_TIME_PATTERN = re.compile(r"DEL\s*time\s*:\s*(.+?)(?:\n|$)", re.I)
 PU_ADDR_PATTERN = re.compile(r"PU\s*Address\s*:\s*(.+?)(?=\n\s*\n|\nDEL|\n-{3,}|$)", re.I | re.S)
 DEL_ADDR_PATTERN = re.compile(r"DEL\s*Address\s*:\s*(.+?)(?=\n\s*\n|\n-{3,}|\nTotal|$)", re.I | re.S)
 
+def parse_time_window(time_str: str) -> dict:
+    """
+    Parse time strings like:
+    - "Dec 10, 2025 08:00 -14:00 FCFS"
+    - "Dec 11, 2025 00:01-23:59 FCFS"
+    - "Dec 10, 2025 08:00"
+    
+    Returns: {
+        "raw": original string,
+        "date": "Dec 10, 2025",
+        "early": "08:00",
+        "late": "14:00" or None,
+        "note": "FCFS" or None,
+        "early_dt": datetime or None,
+        "late_dt": datetime or None
+    }
+    """
+    if not time_str:
+        return {"raw": "", "date": None, "early": None, "late": None, "note": None}
+    
+    result = {
+        "raw": time_str.strip(),
+        "date": None,
+        "early": None,
+        "late": None,
+        "note": None,
+        "early_dt": None,
+        "late_dt": None,
+    }
+    
+    # Extract note like "FCFS", "APPT", etc (at end of string)
+    note_match = re.search(r'\b(FCFS|APPT|BY APPT|APPOINTMENT)\s*$', time_str, re.I)
+    if note_match:
+        result["note"] = note_match.group(1).upper()
+        time_str = time_str[:note_match.start()].strip()
+    
+    # Pattern: "Dec 10, 2025 08:00 -14:00" or "Dec 10, 2025 08:00-14:00"
+    window_match = re.search(
+        r'(\w{3}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2})\s*[-–to]+\s*(\d{1,2}:\d{2})',
+        time_str, re.I
+    )
+    
+    if window_match:
+        # Clean up date format
+        date_str = window_match.group(1).strip()
+        date_str = re.sub(r',\s*', ' ', date_str)  # Remove any existing commas
+        date_str = re.sub(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', r'\1 \2, \3', date_str)
+        result["date"] = date_str
+        result["early"] = window_match.group(2)
+        result["late"] = window_match.group(3)
+    else:
+        # Single time: "Dec 10, 2025 08:00"
+        single_match = re.search(
+            r'(\w{3}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2})',
+            time_str, re.I
+        )
+        if single_match:
+            date_str = single_match.group(1).strip()
+            date_str = re.sub(r',\s*', ' ', date_str)
+            date_str = re.sub(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', r'\1 \2, \3', date_str)
+            result["date"] = date_str
+            result["early"] = single_match.group(2)
+    
+    return result
+
+def format_time_window(tw: dict, tz_name: str = "UTC") -> str:
+    """Format a time window for display."""
+    if not tw or not tw.get("date"):
+        return tw.get("raw", "") if tw else ""
+    
+    # Convert 24h to 12h format
+    def to_12h(t: str) -> str:
+        if not t:
+            return ""
+        try:
+            h, m = map(int, t.split(":"))
+            suffix = "AM" if h < 12 else "PM"
+            h = h % 12 or 12
+            return f"{h}:{m:02d} {suffix}"
+        except:
+            return t
+    
+    date_part = tw["date"]
+    
+    # Try to shorten date (remove year if current year)
+    try:
+        if "2025" in date_part:
+            date_part = date_part.replace(", 2025", "").replace(" 2025", "")
+    except:
+        pass
+    
+    if tw.get("late"):
+        time_part = f"{to_12h(tw['early'])} - {to_12h(tw['late'])}"
+    else:
+        time_part = to_12h(tw.get("early", ""))
+    
+    result = f"{date_part} • {time_part}"
+    
+    if tw.get("note"):
+        result += f" ({tw['note']})"
+    
+    return result
+
+def get_appointment_deadline(tw: dict, tz_name: str) -> Optional[datetime]:
+    """Get the latest acceptable arrival time (for ETA warnings)."""
+    if not tw or not tw.get("date"):
+        return None
+    
+    # Use late time if available, otherwise early time
+    target_time = tw.get("late") or tw.get("early")
+    if not target_time:
+        return None
+    
+    try:
+        # Parse date
+        date_str = tw["date"]
+        # Normalize format
+        date_str = re.sub(r',?\s+', ' ', date_str).strip()
+        
+        dt_str = f"{date_str} {target_time}"
+        
+        # Try multiple formats
+        for fmt in ["%b %d %Y %H:%M", "%B %d %Y %H:%M"]:
+            try:
+                dt = datetime.strptime(dt_str, fmt)
+                return dt.replace(tzinfo=safe_tz(tz_name))
+            except ValueError:
+                continue
+        
+        return None
+    except:
+        return None
+
+def check_eta_vs_window(eta_seconds: float, tw: dict, tz_name: str) -> dict:
+    """
+    Check if ETA meets the appointment window.
+    Returns: {"status": "early"|"on_time"|"late"|"unknown", "message": str}
+    """
+    if not tw or not tw.get("date"):
+        return {"status": "unknown", "message": ""}
+    
+    deadline = get_appointment_deadline(tw, tz_name)
+    if not deadline:
+        return {"status": "unknown", "message": ""}
+    
+    arrival = now_utc() + timedelta(seconds=eta_seconds)
+    
+    # Get early time for window start
+    early_dt = None
+    if tw.get("early") and tw.get("date"):
+        try:
+            date_str = re.sub(r',?\s+', ' ', tw["date"]).strip()
+            dt_str = f"{date_str} {tw['early']}"
+            for fmt in ["%b %d %Y %H:%M", "%B %d %Y %H:%M"]:
+                try:
+                    early_dt = datetime.strptime(dt_str, fmt).replace(tzinfo=safe_tz(tz_name))
+                    break
+                except ValueError:
+                    continue
+        except:
+            pass
+    
+    # Calculate time differences
+    mins_until_deadline = (deadline - arrival).total_seconds() / 60
+    
+    if mins_until_deadline < -15:
+        return {
+            "status": "late",
+            "message": f"⚠️ {abs(int(mins_until_deadline))}m past deadline"
+        }
+    elif mins_until_deadline < 30:
+        return {
+            "status": "tight",
+            "message": f"⏱ Cutting it close ({int(mins_until_deadline)}m buffer)"
+        }
+    elif early_dt and arrival < early_dt:
+        mins_early = (early_dt - arrival).total_seconds() / 60
+        return {
+            "status": "early",
+            "message": f"☕ {int(mins_early)}m early - window opens {tw['early']}"
+        }
+    else:
+        return {
+            "status": "on_time",
+            "message": "✅ On time"
+        }
+
 def clean_address(addr: str) -> str:
-    """Clean address from load sheet."""
     if not addr:
         return ""
     
@@ -553,19 +736,13 @@ def clean_address(addr: str) -> str:
     if not lines:
         return ""
     
-    # Join lines, preserving structure
-    # First line might be company name, rest is address
     result = ", ".join(lines)
-    
-    # Clean up
     result = re.sub(r'\s+', ' ', result)
     result = re.sub(r',\s*,', ',', result)
     
     return result.strip()
 
 def parse_load(text: str) -> Optional[dict]:
-    """Parse load from dispatcher message."""
-    
     if "pu address" not in text.lower() or "del address" not in text.lower():
         return None
     
@@ -575,7 +752,6 @@ def parse_load(text: str) -> Optional[dict]:
     m = LOAD_NUM_PATTERN.search(text)
     if m:
         load_num = m.group(1).strip()
-        log(f"  Load #: {load_num}")
     
     rate = None
     m = RATE_PATTERN.search(text)
@@ -591,30 +767,29 @@ def parse_load(text: str) -> Optional[dict]:
             miles = int(m.group(1).replace(",", ""))
         except: pass
     
-    pu_time = None
+    pu_time_raw = None
     m = PU_TIME_PATTERN.search(text)
     if m:
-        pu_time = m.group(1).strip()
+        pu_time_raw = m.group(1).strip()
+    pu_time = parse_time_window(pu_time_raw)
     
-    del_time = None
+    del_time_raw = None
     m = DEL_TIME_PATTERN.search(text)
     if m:
-        del_time = m.group(1).strip()
+        del_time_raw = m.group(1).strip()
+    del_time = parse_time_window(del_time_raw)
     
     pu_addr = None
     m = PU_ADDR_PATTERN.search(text)
     if m:
         pu_addr = clean_address(m.group(1))
-        log(f"  PU: {pu_addr}")
     
     del_addr = None
     m = DEL_ADDR_PATTERN.search(text)
     if m:
         del_addr = clean_address(m.group(1))
-        log(f"  DEL: {del_addr}")
     
     if not pu_addr or not del_addr:
-        log("  FAILED: Missing address")
         return None
     
     job_id = hashlib.sha1(f"{load_num}|{pu_addr}|{del_addr}".encode()).hexdigest()[:10]
@@ -637,7 +812,7 @@ def parse_load(text: str) -> Optional[dict]:
         }],
     }
     
-    log(f"  SUCCESS: Job {job_id}")
+    log(f"Parsed: {load_num} | ${rate} | {miles}mi")
     return job
 
 def get_job(st: dict) -> Optional[dict]:
@@ -674,12 +849,12 @@ def get_focus(job: dict, st: dict) -> Tuple[str, int]:
 def load_label(job: dict) -> str:
     meta = job.get("meta") or {}
     if meta.get("load_number"):
-        return f"Load #{meta['load_number']}"
-    return f"Job {job.get('id', '?')[:8]}"
+        return f"#{meta['load_number']}"
+    return f"#{job.get('id', '?')[:8]}"
 
 def short_addr(addr: str, max_len: int = 50) -> str:
     if not addr:
-        return "(no address)"
+        return "—"
     if len(addr) <= max_len:
         return addr
     return addr[:max_len-3] + "..."
@@ -691,14 +866,36 @@ def toggle_timestamp(obj: dict, key: str) -> bool:
     obj[key] = now_iso()
     return True
 
+def get_completion_stats(job: dict) -> Tuple[int, int]:
+    """Get (completed_steps, total_steps) for progress display."""
+    total = 0
+    completed = 0
+    
+    # PU steps: arrived, loaded, departed, complete
+    pu_status = job.get("pu", {}).get("status", {})
+    for key in ["arr", "load", "dep", "comp"]:
+        total += 1
+        if pu_status.get(key):
+            completed += 1
+    
+    # DEL steps for each delivery
+    for d in job.get("del", []):
+        ds = d.get("status", {})
+        for key in ["arr", "del", "dep", "comp"]:
+            total += 1
+            if ds.get(key):
+                completed += 1
+    
+    return completed, total
+
 # ============================================================================
-# KEYBOARDS
+# BEAUTIFUL KEYBOARDS
 # ============================================================================
 def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text, callback_data=data)
 
-def check(on: bool, label: str) -> str:
-    return f"✅ {label}" if on else label
+def status_icon(done: bool) -> str:
+    return "✓" if done else "○"
 
 def build_panel_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
     stage, idx = get_focus(job, st)
@@ -709,15 +906,17 @@ def build_panel_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
         ps = pu.get("status", {})
         pd = pu.get("docs", {})
         
+        # Status row with cleaner icons
         rows.append([
-            btn(check(ps.get("arr"), "Arrived"), "PU:ARR"),
-            btn(check(ps.get("load"), "Loaded"), "PU:LOAD"),
-            btn(check(ps.get("dep"), "Departed"), "PU:DEP"),
+            btn(f"{status_icon(ps.get('arr'))} Arrive", "PU:ARR"),
+            btn(f"{status_icon(ps.get('load'))} Load", "PU:LOAD"),
+            btn(f"{status_icon(ps.get('dep'))} Depart", "PU:DEP"),
         ])
+        # Docs and complete
         rows.append([
-            btn(check(pd.get("pti"), "PTI"), "DOC:PTI"),
-            btn(check(pd.get("bol"), "BOL"), "DOC:BOL"),
-            btn(check(ps.get("comp"), "✓ PU Done"), "PU:COMP"),
+            btn(f"{'📋' if pd.get('pti') else '○'} PTI", "DOC:PTI"),
+            btn(f"{'📋' if pd.get('bol') else '○'} BOL", "DOC:BOL"),
+            btn(f"{'✅' if ps.get('comp') else '⬜'} Complete", "PU:COMP"),
         ])
     else:
         dels = job.get("del", [])
@@ -725,35 +924,47 @@ def build_panel_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
             d = dels[idx]
             ds = d.get("status", {})
             dd = d.get("docs", {})
-            lbl = f"{idx+1}/{len(dels)}"
             
+            # Status row
             rows.append([
-                btn(check(ds.get("arr"), f"Arr {lbl}"), "DEL:ARR"),
-                btn(check(ds.get("del"), "Delivered"), "DEL:DEL"),
-                btn(check(ds.get("dep"), "Departed"), "DEL:DEP"),
+                btn(f"{status_icon(ds.get('arr'))} Arrive", "DEL:ARR"),
+                btn(f"{status_icon(ds.get('del'))} Deliver", "DEL:DEL"),
+                btn(f"{status_icon(ds.get('dep'))} Depart", "DEL:DEP"),
             ])
+            # Docs, complete, skip
             rows.append([
-                btn(check(dd.get("pod"), "POD"), "DOC:POD"),
-                btn(check(ds.get("comp"), "✓ Done"), "DEL:COMP"),
+                btn(f"{'📋' if dd.get('pod') else '○'} POD", "DOC:POD"),
+                btn(f"{'✅' if ds.get('comp') else '⬜'} Complete", "DEL:COMP"),
                 btn("⏭ Skip", "DEL:SKIP"),
             ])
             
+            # Navigation for multi-stop
             if len(dels) > 1:
                 nav = []
                 if idx > 0:
-                    nav.append(btn("◀️ Prev", f"NAV:{idx-1}"))
+                    nav.append(btn("◀ Prev", f"NAV:{idx-1}"))
+                nav.append(btn(f"Stop {idx+1}/{len(dels)}", "NOOP"))
                 if idx < len(dels) - 1:
-                    nav.append(btn("Next ▶️", f"NAV:{idx+1}"))
-                if nav:
-                    rows.append(nav)
+                    nav.append(btn("Next ▶", f"NAV:{idx+1}"))
+                rows.append(nav)
     
-    rows.append([btn("📍 ETA", "ETA:ONE"), btn("📍 All ETAs", "ETA:ALL")])
-    rows.append([btn("📊 Catalog", "CATALOG"), btn("✅ Finish Load", "FINISH")])
+    # Bottom action row
+    rows.append([
+        btn("🧭 ETA", "ETA:ONE"),
+        btn("📍 All ETAs", "ETA:ALL"),
+    ])
+    rows.append([
+        btn("📊 Catalog", "CATALOG"),
+        btn("🏁 Finish", "FINISH"),
+    ])
     
     return InlineKeyboardMarkup(rows)
 
 def build_done_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[btn("📊 Catalog", "CATALOG")]])
+    return InlineKeyboardMarkup([
+        [btn("📊 View Catalog", "CATALOG")],
+        [btn("🔄 New Load Ready", "NOOP")]
+    ])
 
 # ============================================================================
 # ALERTS
@@ -775,46 +986,63 @@ async def send_alert(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
         log_error("Alert failed", e)
 
 # ============================================================================
-# EXCEL EXPORT
+# EXCEL EXPORT - Enhanced
 # ============================================================================
 def make_catalog_xlsx(records: List[dict], week: str) -> Tuple[bytes, str]:
     wb = Workbook()
     ws = wb.active
     ws.title = week[:31] if week != "ALL" else "All Loads"
     
-    headers = ["Completed", "Load #", "Pickup", "Delivery", "Rate", "Miles", "$/Mile"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-        cell.fill = PatternFill("solid", fgColor="4472C4")
+    # Header styling
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="2C3E50")
+    header_align = Alignment(horizontal="center", vertical="center")
     
+    headers = ["Date", "Load #", "Origin", "Destination", "Rate", "Miles", "$/Mi"]
+    ws.append(headers)
+    
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+    
+    # Data rows
     total_rate, total_miles = 0, 0
+    money_format = '"$"#,##0'
+    
     for r in sorted(records, key=lambda x: x.get("completed_utc", "")):
         rate = r.get("rate")
         miles = r.get("posted_miles") or r.get("est_miles")
         rpm = (rate / miles) if rate and miles else None
         
-        ws.append([
-            r.get("completed", ""),
+        row = [
+            r.get("completed", "")[:10],  # Just date
             r.get("load_number", ""),
-            r.get("pickup", "")[:50],
-            r.get("deliveries", "")[:50],
+            r.get("pickup", "")[:40],
+            r.get("deliveries", "")[:40],
             rate,
             miles,
             round(rpm, 2) if rpm else None,
-        ])
+        ]
+        ws.append(row)
         
         if rate: total_rate += rate
         if miles: total_miles += miles
     
+    # Totals row
     ws.append([])
-    ws.append(["TOTAL", "", "", "", total_rate, total_miles,
-               round(total_rate/total_miles, 2) if total_miles else None])
+    total_row = ["TOTAL", f"{len(records)} loads", "", "", total_rate, total_miles,
+                 round(total_rate/total_miles, 2) if total_miles else None]
+    ws.append(total_row)
+    
     for cell in ws[ws.max_row]:
         cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="ECF0F1")
     
-    for col, width in [("A", 18), ("B", 15), ("C", 40), ("D", 40), ("E", 12), ("F", 10), ("G", 10)]:
-        ws.column_dimensions[col].width = width
+    # Column widths
+    widths = [12, 14, 35, 35, 10, 8, 8]
+    for i, w in enumerate(widths):
+        ws.column_dimensions[chr(65 + i)].width = w
     
     buf = io.BytesIO()
     wb.save(buf)
@@ -822,60 +1050,339 @@ def make_catalog_xlsx(records: List[dict], week: str) -> Tuple[bytes, str]:
     return buf.getvalue(), filename
 
 # ============================================================================
-# COMMAND HANDLERS
+# BEAUTIFUL MESSAGE BUILDERS
 # ============================================================================
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = f"""🚚 <b>Trucker Dispatch Bot</b> v{BOT_VERSION}
+def build_start_message() -> str:
+    return f"""
+<b>🚛 DISPATCH ASSISTANT</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
 
-<b>Setup:</b>
-1. DM: /claim &lt;code&gt;
-2. DM: /update (share location)
-3. Group: /allowhere
+Welcome! I help track your loads, calculate ETAs, and manage documentation.
 
-<b>Usage:</b>
-• Forward load sheet → auto-detects
-• Type <code>eta</code> or <code>1717</code>
-• /panel for controls
+<b>⚡ QUICK START</b>
+<code>┌────────────────────────┐</code>
+<code>│</code> 1️⃣  DM me /claim code    <code>│</code>
+<code>│</code> 2️⃣  DM me /update        <code>│</code>
+<code>│</code> 3️⃣  Add me to group      <code>│</code>
+<code>│</code> 4️⃣  Type /allowhere      <code>│</code>
+<code>└────────────────────────┘</code>
 
-<b>Debug:</b>
-/testgeo &lt;address&gt; - Test geocoding
-/clearcache - Reset address cache"""
-    
-    await update.message.reply_text(text, parse_mode="HTML")
+<b>📱 COMMANDS</b>
+• <code>eta</code> or <code>1717</code> — Get ETA
+• /panel — Control panel
+• /catalog — Weekly report
+• /finish — Complete load
 
-async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🏓 pong • {BOT_VERSION}")
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+<i>v{BOT_VERSION} • Powered by OSRM</i>
+"""
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    async with _state_lock:
-        st = load_state()
-    
+def build_status_message(st: dict, update: Update) -> str:
     job = get_job(st)
     loc = st.get("last_location")
     gc = st.get("geocode_cache", {})
+    history = st.get("history", [])
     
-    loc_info = "❌ Not set"
+    # Location status
+    loc_status = "❌ Not set"
     if loc:
         age_min = 0
         if loc.get("updated_at"):
             try:
                 age_min = int((now_utc() - datetime.fromisoformat(loc["updated_at"])).total_seconds() / 60)
             except: pass
-        loc_info = f"✅ {loc['lat']:.4f}, {loc['lon']:.4f} ({age_min}m ago)"
+        if age_min < 5:
+            loc_status = f"🟢 Live ({age_min}m)"
+        elif age_min < 30:
+            loc_status = f"🟡 Recent ({age_min}m)"
+        else:
+            loc_status = f"🔴 Stale ({age_min}m)"
     
-    text = f"""<b>Status</b>
-• Version: {BOT_VERSION}
-• Owner: {st.get('owner_id', 'Not set')}
-• Location: {loc_info}
-• Active load: {load_label(job) if job else '❌ None'}
-• History: {len(st.get('history', []))} loads
-• Cache: {len(gc)} addresses
-• Debug: {'ON' if DEBUG else 'OFF'}"""
+    # Job status
+    if job:
+        completed, total = get_completion_stats(job)
+        progress = progress_bar(completed, total, 8)
+        job_status = f"🟢 {load_label(job)} [{progress}]"
+    else:
+        job_status = "⚪ No active load"
     
-    await update.message.reply_text(text, parse_mode="HTML")
+    # Weekly stats
+    tz_name = loc.get("tz", "UTC") if loc else "UTC"
+    week = week_key(now_utc().astimezone(safe_tz(tz_name)))
+    week_loads = [r for r in history if r.get("week") == week]
+    week_earnings = sum(r.get("rate", 0) or 0 for r in week_loads)
+    
+    return f"""
+<b>📊 SYSTEM STATUS</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+<b>🔗 Connection</b>
+   Location: {loc_status}
+   Cache: {len(gc)} addresses
+
+<b>📦 Current Load</b>
+   {job_status}
+
+<b>📈 This Week</b>
+   Loads: {len(week_loads)}
+   Earnings: {money(week_earnings)}
+
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+<i>v{BOT_VERSION}</i>
+"""
+
+def build_new_load_message(job: dict) -> str:
+    meta = job.get("meta", {})
+    pu = job.get("pu", {})
+    dels = job.get("del", [])
+    
+    # Calculate rate per mile if available
+    rpm = ""
+    if meta.get("rate") and meta.get("miles"):
+        rpm_val = meta["rate"] / meta["miles"]
+        rpm = f"   <i>${rpm_val:.2f}/mi</i>\n"
+    
+    # Format time windows
+    pu_time = pu.get("time", {})
+    pu_time_str = ""
+    if isinstance(pu_time, dict) and pu_time.get("date"):
+        pu_time_str = f"\n🕐 {format_time_window(pu_time)}"
+    elif isinstance(pu_time, str) and pu_time:
+        pu_time_str = f"\n🕐 {pu_time}"
+    
+    del_time_str = ""
+    if dels:
+        del_time = dels[0].get("time", {})
+        if isinstance(del_time, dict) and del_time.get("date"):
+            del_time_str = f"\n🕐 {format_time_window(del_time)}"
+        elif isinstance(del_time, str) and del_time:
+            del_time_str = f"\n🕐 {del_time}"
+    
+    return f"""
+<b>📦 NEW LOAD DETECTED</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+<b>{load_label(job)}</b>
+{money(meta.get('rate'))}  •  {meta.get('miles') or '—'} mi
+{rpm}
+<b>📍 Pickup</b>
+{h(short_addr(pu.get('addr', ''), 50))}{pu_time_str}
+
+<b>🏁 Delivery</b>
+{h(short_addr(dels[0].get('addr', '') if dels else '', 50))}{del_time_str}
+
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+Type <code>eta</code> or tap /panel
+"""
+
+def build_panel_message(job: dict, st: dict) -> str:
+    meta = job.get("meta", {})
+    stage, idx = get_focus(job, st)
+    completed, total = get_completion_stats(job)
+    progress = progress_bar(completed, total, 12)
+    
+    # Header
+    lines = [
+        f"<b>🚛 {load_label(job)}</b>",
+        f"<code>{progress}</code> {completed}/{total}",
+        "",
+    ]
+    
+    # Rate/miles info
+    if meta.get("rate") or meta.get("miles"):
+        info_parts = []
+        if meta.get("rate"):
+            info_parts.append(f"💵 {money(meta['rate'])}")
+        if meta.get("miles"):
+            info_parts.append(f"🛣 {meta['miles']} mi")
+        if meta.get("rate") and meta.get("miles"):
+            rpm = meta["rate"] / meta["miles"]
+            info_parts.append(f"${rpm:.2f}/mi")
+        lines.append(" • ".join(info_parts))
+        lines.append("")
+    
+    # Current focus
+    if stage == "PU":
+        pu = job.get("pu", {})
+        ps = pu.get("status", {})
+        
+        status_text = "⏳ In Progress"
+        if ps.get("comp"):
+            status_text = "✅ Complete"
+        elif ps.get("dep"):
+            status_text = "🚛 Departed"
+        elif ps.get("load"):
+            status_text = "📦 Loaded"
+        elif ps.get("arr"):
+            status_text = "📍 On Site"
+        
+        lines.append(f"<b>📦 PICKUP</b>  {status_text}")
+        lines.append(f"<code>{h(short_addr(pu.get('addr', ''), 45))}</code>")
+        
+        # Time window display
+        pu_time = pu.get("time", {})
+        if isinstance(pu_time, dict) and pu_time.get("date"):
+            lines.append(f"🕐 {format_time_window(pu_time)}")
+        elif isinstance(pu_time, str) and pu_time:
+            lines.append(f"🕐 {h(pu_time)}")
+    else:
+        dels = job.get("del", [])
+        if idx < len(dels):
+            d = dels[idx]
+            ds = d.get("status", {})
+            
+            status_text = "⏳ In Progress"
+            if ds.get("comp"):
+                status_text = "✅ Complete"
+            elif ds.get("skip"):
+                status_text = "⏭ Skipped"
+            elif ds.get("dep"):
+                status_text = "🚛 Departed"
+            elif ds.get("del"):
+                status_text = "📦 Delivered"
+            elif ds.get("arr"):
+                status_text = "📍 On Site"
+            
+            stop_label = f"STOP {idx+1}/{len(dels)}" if len(dels) > 1 else "DELIVERY"
+            lines.append(f"<b>🏁 {stop_label}</b>  {status_text}")
+            lines.append(f"<code>{h(short_addr(d.get('addr', ''), 45))}</code>")
+            
+            # Time window display
+            del_time = d.get("time", {})
+            if isinstance(del_time, dict) and del_time.get("date"):
+                lines.append(f"🕐 {format_time_window(del_time)}")
+            elif isinstance(del_time, str) and del_time:
+                lines.append(f"🕐 {h(del_time)}")
+    
+    return "\n".join(lines)
+
+def build_eta_message(eta: dict, label: str, addr: str, appt: any, job: dict, tz_name: str = "UTC", age_warn: str = "") -> str:
+    if not eta["ok"]:
+        return f"""
+<b>⚠️ ETA UNAVAILABLE</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+{eta['err']}
+
+<b>📍 {label}</b>
+<code>{h(short_addr(addr, 45))}</code>
+
+<i>Try /clearcache and retry</i>
+"""
+    
+    arr_time = now_utc() + timedelta(seconds=eta["seconds"])
+    tz = safe_tz(eta.get("tz", tz_name))
+    arr_str = arr_time.astimezone(tz).strftime("%I:%M %p")
+    
+    method_note = " <i>(estimated)</i>" if eta["method"] == "estimate" else ""
+    
+    lines = [
+        f"<b>🧭 ETA: {fmt_dur(eta['seconds'])}</b>{method_note}",
+        f"<code>━━━━━━━━━━━━━━━━━━━━━━</code>",
+        "",
+        f"<b>{label}</b>  •  {load_label(job)}",
+        f"📍 <code>{h(short_addr(addr, 40))}</code>",
+        "",
+        f"🛣 {fmt_mi(eta['meters'])}",
+        f"🕐 Arrive ~{arr_str}",
+    ]
+    
+    # Handle time window
+    if isinstance(appt, dict) and appt.get("date"):
+        lines.append(f"📅 Window: {format_time_window(appt)}")
+        
+        # Check if on time
+        window_check = check_eta_vs_window(eta["seconds"], appt, tz_name)
+        if window_check.get("message"):
+            lines.append(window_check["message"])
+    elif isinstance(appt, str) and appt:
+        lines.append(f"📅 Appt: {h(appt)}")
+    
+    if age_warn:
+        lines.append("")
+        lines.append(age_warn)
+    
+    return "\n".join(lines)
+
+def build_all_etas_message(etas: List[dict], job: dict, age_warn: str = "") -> str:
+    lines = [
+        f"<b>📍 ALL ETAs</b>  •  {load_label(job)}",
+        f"<code>━━━━━━━━━━━━━━━━━━━━━━</code>",
+        "",
+    ]
+    
+    for e in etas:
+        if e.get("complete"):
+            lines.append(f"✅ <s>{e['label']}</s>")
+        elif e.get("ok"):
+            method = "≈" if e.get("method") == "estimate" else ""
+            lines.append(f"<b>{e['label']}</b>: {fmt_dur(e['seconds'])}{method} • {fmt_mi(e['meters'])}")
+        else:
+            lines.append(f"⚠️ <b>{e['label']}</b>: {e.get('err', 'Error')}")
+    
+    if age_warn:
+        lines.append("")
+        lines.append(age_warn)
+    
+    return "\n".join(lines)
+
+def build_finish_message(job: dict, st: dict) -> str:
+    meta = job.get("meta", {})
+    tz_name = (st.get("last_location") or {}).get("tz", "UTC")
+    wk = week_key(now_utc().astimezone(safe_tz(tz_name)))
+    
+    history = st.get("history", [])
+    week_records = [r for r in history if r.get("week") == wk]
+    wk_count = len(week_records)
+    wk_rate = sum(r.get("rate", 0) or 0 for r in week_records)
+    wk_miles = sum(r.get("posted_miles", 0) or 0 for r in week_records)
+    wk_rpm = wk_rate / wk_miles if wk_miles else 0
+    
+    return f"""
+<b>✅ LOAD COMPLETE</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+<b>{load_label(job)}</b>
+{money(meta.get('rate'))}  •  {meta.get('miles') or '—'} mi
+
+<b>📊 WEEK {wk}</b>
+<code>┌────────────────────────┐</code>
+<code>│</code>  Loads:     <b>{wk_count}</b>
+<code>│</code>  Gross:     <b>{money(wk_rate)}</b>
+<code>│</code>  Miles:     <b>{wk_miles}</b>
+<code>│</code>  Avg $/mi:  <b>${wk_rpm:.2f}</b>
+<code>└────────────────────────┘</code>
+
+<i>Ready for next load!</i>
+"""
+
+def build_alert_message(icon: str, title: str, detail: str = "", timestamp: str = "") -> str:
+    lines = [f"{icon} <b>{title}</b>"]
+    if detail:
+        lines.append(detail)
+    if timestamp:
+        lines.append(f"<i>{timestamp}</i>")
+    return "\n".join(lines)
+
+# ============================================================================
+# COMMAND HANDLERS
+# ============================================================================
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_start_message(), parse_mode="HTML")
+
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🏓 <b>Pong!</b>\n<i>v{BOT_VERSION} • Online</i>", parse_mode="HTML")
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    async with _state_lock:
+        st = load_state()
+    
+    await update.message.reply_text(
+        build_status_message(st, update),
+        parse_mode="HTML"
+    )
 
 async def cmd_testgeo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Test geocoding for an address."""
     async with _state_lock:
         st = load_state()
     
@@ -888,47 +1395,56 @@ async def cmd_testgeo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     addr = " ".join(ctx.args)
-    await update.message.reply_text(f"🔍 Testing: {addr}\n\nPlease wait...")
+    await update.message.reply_text(f"🔍 Testing: <code>{h(addr)}</code>", parse_mode="HTML")
     
-    cache = {}  # Fresh cache for test
+    cache = {}
     geo = await geocode(addr, cache)
     
     if geo:
         lat, lon, tz = geo
         await update.message.reply_text(
-            f"✅ <b>Geocode SUCCESS</b>\n\n"
-            f"📍 {lat:.6f}, {lon:.6f}\n"
-            f"🕐 Timezone: {tz}\n\n"
-            f"<a href=\"https://www.google.com/maps?q={lat},{lon}\">Open in Google Maps</a>",
+            f"""
+<b>✅ GEOCODE SUCCESS</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+📍 {lat:.6f}, {lon:.6f}
+🕐 Timezone: {tz}
+
+<a href="https://www.google.com/maps?q={lat},{lon}">Open in Google Maps</a>
+""",
             parse_mode="HTML"
         )
-        # Send location pin
         try:
             await ctx.bot.send_location(update.effective_chat.id, lat, lon)
         except: pass
     else:
-        # Show what variants were tried
         variants = generate_address_variants(addr)
-        variant_list = "\n".join(f"• {v}" for v in variants[:6])
+        variant_list = "\n".join(f"  • {v}" for v in variants[:5])
         await update.message.reply_text(
-            f"❌ <b>Geocode FAILED</b>\n\n"
-            f"Tried variants:\n{variant_list}\n\n"
-            f"All services returned no results.",
+            f"""
+<b>❌ GEOCODE FAILED</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Tried variants:
+{variant_list}
+
+All services returned no results.
+""",
             parse_mode="HTML"
         )
 
 async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
-        await update.message.reply_text("⚠️ DM me: /claim <code>")
+        await update.message.reply_text("⚠️ Please DM me: /claim <code>")
         return
     
     if not CLAIM_CODE:
-        await update.message.reply_text("⚠️ CLAIM_CODE not set")
+        await update.message.reply_text("⚠️ CLAIM_CODE not configured")
         return
     
     code = " ".join(ctx.args) if ctx.args else ""
     if code != CLAIM_CODE:
-        await update.message.reply_text("❌ Wrong code")
+        await update.message.reply_text("❌ Invalid code")
         return
     
     async with _state_lock:
@@ -936,8 +1452,19 @@ async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st["owner_id"] = update.effective_user.id
         save_state(st)
     
-    log(f"Owner: {update.effective_user.id}")
-    await update.message.reply_text("✅ You're the owner! Use /update to share location.")
+    log(f"Owner claimed: {update.effective_user.id}")
+    await update.message.reply_text(
+        """
+<b>✅ OWNERSHIP CONFIRMED</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+You now control this bot!
+
+<b>Next step:</b>
+Send /update to share your location
+""",
+        parse_mode="HTML"
+    )
 
 async def cmd_allowhere(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with _state_lock:
@@ -948,7 +1475,7 @@ async def cmd_allowhere(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     if update.effective_chat.type == "private":
-        await update.message.reply_text("⚠️ Run in group")
+        await update.message.reply_text("⚠️ Run this in a group")
         return
     
     async with _state_lock:
@@ -959,7 +1486,17 @@ async def cmd_allowhere(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         save_state(st)
     
     log(f"Group allowed: {update.effective_chat.id}")
-    await update.message.reply_text("✅ Group allowed!")
+    await update.message.reply_text(
+        """
+<b>✅ GROUP AUTHORIZED</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+This group can now receive load updates.
+
+Forward a load sheet to get started!
+""",
+        parse_mode="HTML"
+    )
 
 async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with _state_lock:
@@ -970,12 +1507,20 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     if update.effective_chat.type != "private":
-        await update.message.reply_text("📍 DM me /update")
+        await update.message.reply_text("📍 Please DM me /update")
         return
     
-    kb = [[KeyboardButton("📍 Share Location", request_location=True)]]
+    kb = [[KeyboardButton("📍 Share My Location", request_location=True)]]
     await update.message.reply_text(
-        "Tap to share location.\n💡 Use 'Live Location' for geofence!",
+        """
+<b>📍 LOCATION UPDATE</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Tap the button below to share.
+
+<b>💡 Pro tip:</b> Use <i>Live Location</i> for automatic geofence alerts!
+""",
+        parse_mode="HTML",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
     )
 
@@ -984,37 +1529,24 @@ async def cmd_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st = load_state()
     
     if not chat_allowed(update, st):
-        await update.message.reply_text("⚠️ Not allowed")
+        await update.message.reply_text("⚠️ Not authorized")
         return
     
     job = get_job(st)
     if not job:
-        await update.message.reply_text("📭 No active load")
+        await update.message.reply_text(
+            """
+<b>📭 NO ACTIVE LOAD</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Forward a load sheet to get started.
+""",
+            parse_mode="HTML"
+        )
         return
     
-    meta = job.get("meta", {})
-    stage, idx = get_focus(job, st)
-    
-    lines = [f"<b>{h(load_label(job))}</b>"]
-    if meta.get("rate") or meta.get("miles"):
-        parts = []
-        if meta.get("rate"): parts.append(f"💰 {money(meta['rate'])}")
-        if meta.get("miles"): parts.append(f"{meta['miles']} mi")
-        lines.append(" • ".join(parts))
-    
-    if stage == "PU":
-        pu = job.get("pu", {})
-        lines.append(f"\n<b>📍 Pickup</b>")
-        lines.append(h(short_addr(pu.get("addr", ""), 60)))
-    else:
-        dels = job.get("del", [])
-        if idx < len(dels):
-            d = dels[idx]
-            lines.append(f"\n<b>📍 Delivery {idx+1}/{len(dels)}</b>")
-            lines.append(h(short_addr(d.get("addr", ""), 60)))
-    
     msg = await update.message.reply_text(
-        "\n".join(lines),
+        build_panel_message(job, st),
         parse_mode="HTML",
         reply_markup=build_panel_keyboard(job, st)
     )
@@ -1049,7 +1581,15 @@ async def cmd_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     history = st.get("history", [])
     if not history:
-        await update.message.reply_text("📭 No loads yet")
+        await update.message.reply_text(
+            """
+<b>📭 NO HISTORY</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Complete some loads first!
+""",
+            parse_mode="HTML"
+        )
         return
     
     tz_name = (st.get("last_location") or {}).get("tz", "UTC")
@@ -1064,16 +1604,25 @@ async def cmd_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         records = [r for r in history if r.get("week") == week]
     
     if not records:
-        await update.message.reply_text(f"No loads for {week}")
-        return
+        records = history
+        week = "ALL"
     
     xlsx_data, filename = make_catalog_xlsx(records, week)
     total_rate = sum(r.get("rate", 0) or 0 for r in records)
+    total_miles = sum((r.get("posted_miles") or 0) for r in records)
     
     await update.message.reply_document(
         document=io.BytesIO(xlsx_data),
         filename=filename,
-        caption=f"📊 {len(records)} loads • {money(total_rate)}",
+        caption=f"""
+<b>📊 LOAD CATALOG</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Period: <b>{week}</b>
+Loads: <b>{len(records)}</b>
+Gross: <b>{money(total_rate)}</b>
+Miles: <b>{total_miles}</b>
+""",
         parse_mode="HTML"
     )
 
@@ -1107,7 +1656,6 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏭ Skipped stop {idx+1}")
 
 async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Delete messages - doesn't delete itself."""
     async with _state_lock:
         st = load_state()
     
@@ -1128,7 +1676,7 @@ async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = max(1, min(n, 2000))
     
     cmd_msg_id = update.message.message_id
-    status_msg = await update.message.reply_text(f"🧹 Deleting up to {n} messages...")
+    status_msg = await update.message.reply_text(f"🧹 Cleaning up...")
     status_msg_id = status_msg.message_id
     
     deleted = 0
@@ -1156,7 +1704,7 @@ async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except: pass
     
     try:
-        await status_msg.edit_text(f"✅ Deleted {deleted} messages")
+        await status_msg.edit_text(f"✅ Removed {deleted} messages")
         await asyncio.sleep(3)
         await ctx.bot.delete_message(chat.id, status_msg_id)
     except: pass
@@ -1179,13 +1727,12 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st["allowed_chats"] = list(allowed)
         save_state(st)
     
-    await update.message.reply_text("👋")
+    await update.message.reply_text("👋 Goodbye!")
     try:
         await ctx.bot.leave_chat(chat.id)
     except: pass
 
 async def cmd_clearcache(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Clear geocode cache."""
     async with _state_lock:
         st = load_state()
     
@@ -1231,7 +1778,16 @@ async def on_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     if update.effective_chat.type == "private":
         await update.message.reply_text(
-            f"✅ Location saved!\n📍 {loc.latitude:.4f}, {loc.longitude:.4f}\n🕐 {tz}",
+            f"""
+<b>✅ LOCATION SAVED</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+📍 {loc.latitude:.4f}, {loc.longitude:.4f}
+🕐 {tz}
+
+You're all set!
+""",
+            parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -1262,19 +1818,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 st["geofence_state"] = {}
                 save_state(st)
             
-            meta = job.get("meta", {})
-            lines = [f"📦 <b>New Load!</b>", f"<b>{h(load_label(job))}</b>"]
-            if meta.get("rate") or meta.get("miles"):
-                parts = []
-                if meta.get("rate"): parts.append(f"💰 {money(meta['rate'])}")
-                if meta.get("miles"): parts.append(f"{meta['miles']} mi")
-                lines.append(" • ".join(parts))
-            
-            lines.append(f"\n📍 PU: {h(short_addr(job['pu'].get('addr', ''), 40))}")
-            lines.append(f"📍 DEL: {h(short_addr(job['del'][0].get('addr', ''), 40))}")
-            lines.append(f"\nType <code>eta</code> or /panel")
-            
-            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            await update.message.reply_text(
+                build_new_load_message(job),
+                parse_mode="HTML"
+            )
             return
     
     if not chat_allowed(update, st):
@@ -1296,6 +1843,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     data = query.data
+    
+    # Handle NOOP buttons
+    if data == "NOOP":
+        await query.answer()
+        return
+    
     log_debug(f"Callback: {data}")
     
     await query.answer()
@@ -1329,7 +1882,7 @@ async def handle_catalog_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     
     history = st.get("history", [])
     if not history:
-        await update.effective_message.reply_text("📭 No loads")
+        await update.effective_message.reply_text("📭 No completed loads")
         return
     
     tz_name = (st.get("last_location") or {}).get("tz", "UTC")
@@ -1368,7 +1921,9 @@ async def handle_nav_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st
     
     if job:
         try:
-            await update.callback_query.edit_message_reply_markup(
+            await update.callback_query.edit_message_text(
+                build_panel_message(job, st),
+                parse_mode="HTML",
                 reply_markup=build_panel_keyboard(job, st)
             )
         except: pass
@@ -1389,16 +1944,16 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             ps = job["pu"].setdefault("status", {})
             if data == "PU:ARR":
                 if toggle_timestamp(ps, "arr"):
-                    alert_msg = f"📍 <b>Arrived PU</b> • {h(ts)}"
+                    alert_msg = build_alert_message("📍", "ARRIVED AT PICKUP", "", ts)
             elif data == "PU:LOAD":
                 if toggle_timestamp(ps, "load"):
-                    alert_msg = f"📦 <b>Loaded</b> • {h(ts)}"
+                    alert_msg = build_alert_message("📦", "LOADED", "", ts)
             elif data == "PU:DEP":
                 if toggle_timestamp(ps, "dep"):
-                    alert_msg = f"🚚 <b>Departed PU</b> • {h(ts)}"
+                    alert_msg = build_alert_message("🚛", "DEPARTED PICKUP", "", ts)
             elif data == "PU:COMP":
                 if toggle_timestamp(ps, "comp"):
-                    alert_msg = f"✅ <b>PU Complete</b> • {h(ts)}"
+                    alert_msg = build_alert_message("✅", "PICKUP COMPLETE", "", ts)
         
         elif data.startswith("DEL:"):
             if stage != "DEL":
@@ -1411,20 +1966,20 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 return
             
             ds = dels[idx].setdefault("status", {})
-            lbl = f"{idx+1}/{len(dels)}"
+            lbl = f"Stop {idx+1}" if len(dels) > 1 else "Delivery"
             
             if data == "DEL:ARR":
                 if toggle_timestamp(ds, "arr"):
-                    alert_msg = f"📍 <b>Arrived {lbl}</b> • {h(ts)}"
+                    alert_msg = build_alert_message("📍", f"ARRIVED AT {lbl.upper()}", "", ts)
             elif data == "DEL:DEL":
                 if toggle_timestamp(ds, "del"):
-                    alert_msg = f"📦 <b>Delivered {lbl}</b> • {h(ts)}"
+                    alert_msg = build_alert_message("📦", "DELIVERED", "", ts)
             elif data == "DEL:DEP":
                 if toggle_timestamp(ds, "dep"):
-                    alert_msg = f"🚚 <b>Departed {lbl}</b> • {h(ts)}"
+                    alert_msg = build_alert_message("🚛", f"DEPARTED {lbl.upper()}", "", ts)
             elif data == "DEL:COMP":
                 if toggle_timestamp(ds, "comp"):
-                    alert_msg = f"✅ <b>Complete {lbl}</b> • {h(ts)}"
+                    alert_msg = build_alert_message("✅", f"{lbl.upper()} COMPLETE", "", ts)
                     for i in range(idx + 1, len(dels)):
                         if not dels[i].get("status", {}).get("comp"):
                             st["focus_i"] = i
@@ -1432,7 +1987,7 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             elif data == "DEL:SKIP":
                 ds["skip"] = True
                 ds["comp"] = ds.get("comp") or now_iso()
-                alert_msg = f"⏭ <b>Skipped {lbl}</b>"
+                alert_msg = build_alert_message("⏭", f"SKIPPED {lbl.upper()}", "", ts)
                 for i in range(idx + 1, len(dels)):
                     if not dels[i].get("status", {}).get("comp"):
                         st["focus_i"] = i
@@ -1455,7 +2010,9 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await send_alert(ctx, update.effective_chat.id, alert_msg)
     
     try:
-        await update.callback_query.edit_message_reply_markup(
+        await update.callback_query.edit_message_text(
+            build_panel_message(job, st),
+            parse_mode="HTML",
             reply_markup=build_panel_keyboard(job, st)
         )
     except: pass
@@ -1466,7 +2023,15 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 async def send_eta_response(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, all_stops: bool = False):
     loc = st.get("last_location")
     if not loc:
-        await update.effective_message.reply_text("📍 No location. Owner: /update in DM")
+        await update.effective_message.reply_text(
+            """
+<b>📍 LOCATION NEEDED</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Owner: DM me /update to share location
+""",
+            parse_mode="HTML"
+        )
         return
     
     loc_age_min = 999
@@ -1485,13 +2050,22 @@ async def send_eta_response(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: 
     
     job = get_job(st)
     if not job:
+        local_time = now_utc().astimezone(tz).strftime("%I:%M %p")
         await update.effective_message.reply_text(
-            f"⏱ {now_utc().astimezone(tz).strftime('%H:%M')} ({tz_name})\n\n<i>No active load</i>",
+            f"""
+<b>🕐 {local_time}</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+No active load.
+Forward a load sheet to get started.
+""",
             parse_mode="HTML"
         )
         return
     
-    age_warn = f"\n⚠️ <i>Location {loc_age_min}m old</i>" if loc_age_min > 10 else ""
+    age_warn = ""
+    if loc_age_min > 10:
+        age_warn = f"⚠️ <i>Location is {loc_age_min}m old</i>"
     
     if all_stops:
         await send_all_etas(update, ctx, st, job, origin, tz, tz_name, age_warn)
@@ -1499,31 +2073,36 @@ async def send_eta_response(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: 
         await send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn)
 
 async def send_all_etas(update, ctx, st, job, origin, tz, tz_name, age_warn=""):
-    lines = [f"<b>{h(load_label(job))}</b>{age_warn}", ""]
+    etas = []
     
     pu = job.get("pu", {})
     if pu.get("status", {}).get("comp"):
-        lines.append(f"✅ <b>PU:</b> Done")
+        etas.append({"label": "Pickup", "complete": True})
     else:
         eta = await calc_eta(st, origin, pu.get("addr", ""))
-        if eta["ok"]:
-            arr = (now_utc() + timedelta(seconds=eta["seconds"])).astimezone(tz).strftime("%H:%M")
-            m = "≈" if eta["method"] == "estimate" else ""
-            lines.append(f"<b>PU:</b> {fmt_dur(eta['seconds'])}{m} • {fmt_mi(eta['meters'])} • ~{arr}")
-        else:
-            lines.append(f"<b>PU:</b> ⚠️ {eta['err']}")
+        etas.append({
+            "label": "Pickup",
+            "ok": eta["ok"],
+            "seconds": eta.get("seconds"),
+            "meters": eta.get("meters"),
+            "method": eta.get("method"),
+            "err": eta.get("err"),
+        })
     
     for i, d in enumerate(job.get("del", [])[:ETA_ALL_MAX]):
+        label = f"Stop {i+1}" if len(job.get("del", [])) > 1 else "Delivery"
         if d.get("status", {}).get("comp"):
-            lines.append(f"✅ <b>D{i+1}:</b> Done")
+            etas.append({"label": label, "complete": True})
         else:
             eta = await calc_eta(st, origin, d.get("addr", ""))
-            if eta["ok"]:
-                arr = (now_utc() + timedelta(seconds=eta["seconds"])).astimezone(tz).strftime("%H:%M")
-                m = "≈" if eta["method"] == "estimate" else ""
-                lines.append(f"<b>D{i+1}:</b> {fmt_dur(eta['seconds'])}{m} • {fmt_mi(eta['meters'])} • ~{arr}")
-            else:
-                lines.append(f"<b>D{i+1}:</b> ⚠️ {eta['err']}")
+            etas.append({
+                "label": label,
+                "ok": eta["ok"],
+                "seconds": eta.get("seconds"),
+                "meters": eta.get("meters"),
+                "method": eta.get("method"),
+                "err": eta.get("err"),
+            })
     
     async with _state_lock:
         st2 = load_state()
@@ -1531,7 +2110,8 @@ async def send_all_etas(update, ctx, st, job, origin, tz, tz_name, age_warn=""):
         save_state(st2)
     
     await update.effective_message.reply_text(
-        "\n".join(lines), parse_mode="HTML",
+        build_all_etas_message(etas, job, age_warn),
+        parse_mode="HTML",
         reply_markup=build_panel_keyboard(job, st)
     )
 
@@ -1541,13 +2121,13 @@ async def send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn=""
     if stage == "PU":
         addr = job.get("pu", {}).get("addr", "")
         appt = job.get("pu", {}).get("time")
-        label = "Pickup"
+        label = "📦 PICKUP"
     else:
         dels = job.get("del", [])
         d = dels[idx] if idx < len(dels) else {}
         addr = d.get("addr", "")
         appt = d.get("time")
-        label = f"Delivery {idx+1}/{len(dels)}"
+        label = f"🏁 STOP {idx+1}" if len(dels) > 1 else "🏁 DELIVERY"
     
     eta = await calc_eta(st, origin, addr)
     
@@ -1556,33 +2136,11 @@ async def send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn=""
         st2["geocode_cache"] = st.get("geocode_cache", {})
         save_state(st2)
     
-    if eta["ok"]:
-        arr_time = now_utc() + timedelta(seconds=eta["seconds"])
-        arr_str = arr_time.astimezone(tz).strftime("%H:%M")
-        m = " ≈" if eta["method"] == "estimate" else ""
-        
-        lines = [
-            f"⏱ <b>ETA: {fmt_dur(eta['seconds'])}</b>{m}{age_warn}",
-            "",
-            f"<b>{label}</b> • {h(load_label(job))}",
-            f"📍 {h(short_addr(addr, 50))}",
-            f"🚚 {fmt_mi(eta['meters'])} • ~{arr_str}",
-        ]
-        if appt:
-            lines.append(f"⏰ Appt: {h(appt)}")
-        
-        await update.effective_message.reply_text(
-            "\n".join(lines), parse_mode="HTML",
-            reply_markup=build_panel_keyboard(job, st)
-        )
-    else:
-        await update.effective_message.reply_text(
-            f"⚠️ <b>Could not calculate ETA</b>\n{eta['err']}\n\n"
-            f"📍 {h(short_addr(addr, 45))}\n\n"
-            f"Try: /testgeo {addr[:30]}",
-            parse_mode="HTML",
-            reply_markup=build_panel_keyboard(job, st)
-        )
+    await update.effective_message.reply_text(
+        build_eta_message(eta, label, addr, appt, job, tz_name, age_warn),
+        parse_mode="HTML",
+        reply_markup=build_panel_keyboard(job, st)
+    )
 
 # ============================================================================
 # FINISH LOAD
@@ -1618,33 +2176,22 @@ async def do_finish_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dic
         st["geofence_state"] = {}
         save_state(st)
     
-    week_records = [r for r in st["history"] if r.get("week") == wk]
-    wk_rate = sum(r.get("rate", 0) or 0 for r in week_records)
-    wk_miles = sum(r.get("posted_miles", 0) or 0 for r in week_records)
-    
-    report = f"""✅ <b>Load Complete!</b>
-
-<b>#{h(meta.get('load_number') or job.get('id', '')[:8])}</b> • {money(meta.get('rate'))}
-
-📊 <b>Week {wk}:</b>
-• {len(week_records)} loads
-• {money(wk_rate)} gross
-• {wk_miles} miles"""
-    
     chat_id = update.effective_chat.id
     panel_id = st.get("panel_msgs", {}).get(str(chat_id))
+    
+    msg_text = build_finish_message(job, st)
     
     if panel_id:
         try:
             await ctx.bot.edit_message_text(
                 chat_id=chat_id, message_id=panel_id,
-                text=report, parse_mode="HTML",
+                text=msg_text, parse_mode="HTML",
                 reply_markup=build_done_keyboard()
             )
             return
         except: pass
     
-    await ctx.bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=build_done_keyboard())
+    await ctx.bot.send_message(chat_id, msg_text, parse_mode="HTML", reply_markup=build_done_keyboard())
 
 # ============================================================================
 # BACKGROUND JOBS
@@ -1665,13 +2212,35 @@ async def reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
         
         for threshold in REMINDER_THRESHOLDS_MIN:
             pu = job.get("pu", {})
-            if pu.get("time") and not pu.get("status", {}).get("comp"):
-                appt = parse_appt_time(pu["time"], tz_name)
-                if appt:
-                    mins = (appt - now_utc()).total_seconds() / 60
+            pu_time = pu.get("time")
+            if pu_time and not pu.get("status", {}).get("comp"):
+                # Handle both dict (new) and string (legacy) time formats
+                if isinstance(pu_time, dict):
+                    deadline = get_appointment_deadline(pu_time, tz_name)
+                else:
+                    deadline = parse_appt_time(pu_time, tz_name)
+                
+                if deadline:
+                    mins = (deadline - now_utc()).total_seconds() / 60
                     key = f"appt:pu:{threshold}"
                     if threshold - 5 < mins <= threshold and key not in sent:
-                        alerts.append((key, f"⏰ <b>PU in ~{int(mins)}m</b>"))
+                        alerts.append((key, build_alert_message("⏰", f"PICKUP DEADLINE IN ~{int(mins)}m", "", "")))
+            
+            # Also check delivery windows
+            for i, d in enumerate(job.get("del", [])):
+                del_time = d.get("time")
+                if del_time and not d.get("status", {}).get("comp"):
+                    if isinstance(del_time, dict):
+                        deadline = get_appointment_deadline(del_time, tz_name)
+                    else:
+                        deadline = parse_appt_time(del_time, tz_name)
+                    
+                    if deadline:
+                        mins = (deadline - now_utc()).total_seconds() / 60
+                        key = f"appt:del{i}:{threshold}"
+                        if threshold - 5 < mins <= threshold and key not in sent:
+                            lbl = f"STOP {i+1}" if len(job.get("del", [])) > 1 else "DELIVERY"
+                            alerts.append((key, build_alert_message("⏰", f"{lbl} DEADLINE IN ~{int(mins)}m", "", "")))
         
         if alerts:
             async with _state_lock:
@@ -1733,9 +2302,9 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
                 is_in = dist <= GEOFENCE_MILES
                 
                 if is_in and not was_in:
-                    events.append(("pu", True, "Pickup", pu["addr"]))
+                    events.append(("pu", True, "PICKUP"))
                 elif not is_in and was_in:
-                    events.append(("pu", False, "Pickup", pu["addr"]))
+                    events.append(("pu", False, "PICKUP"))
                 gf_state["pu"] = is_in
         
         for i, d in enumerate(job.get("del", [])):
@@ -1747,10 +2316,11 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
                     was_in = gf_state.get(key, False)
                     is_in = dist <= GEOFENCE_MILES
                     
+                    lbl = f"STOP {i+1}" if len(job.get("del", [])) > 1 else "DELIVERY"
                     if is_in and not was_in:
-                        events.append((key, True, f"Delivery {i+1}", d["addr"]))
+                        events.append((key, True, lbl))
                     elif not is_in and was_in:
-                        events.append((key, False, f"Delivery {i+1}", d["addr"]))
+                        events.append((key, False, lbl))
                     gf_state[key] = is_in
         
         if events:
@@ -1760,9 +2330,9 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
                 if not job:
                     return
                 
-                for key, entered, label, addr in events:
+                for key, entered, label in events:
                     if entered:
-                        msg = f"📍 <b>ARRIVED: {label}</b>"
+                        msg = build_alert_message("📍", f"ARRIVING AT {label}", f"Within {GEOFENCE_MILES} miles", "")
                         if key == "pu":
                             job["pu"].setdefault("status", {})["arr"] = now_iso()
                         elif key.startswith("del"):
@@ -1770,7 +2340,7 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
                             if idx < len(job.get("del", [])):
                                 job["del"][idx].setdefault("status", {})["arr"] = now_iso()
                     else:
-                        msg = f"🚚 <b>DEPARTED: {label}</b>"
+                        msg = build_alert_message("🚛", f"DEPARTED {label}", "", "")
                         if key == "pu":
                             job["pu"].setdefault("status", {})["dep"] = now_iso()
                         elif key.startswith("del"):
@@ -1806,7 +2376,6 @@ async def post_init(app: Application):
         app.job_queue.run_repeating(geofence_job, interval=30, first=15)
     
     log(f"Ready! v{BOT_VERSION}")
-    log(f"Geocoders: {', '.join(s['name'] for s in GEOCODE_SERVICES)}")
 
 def main():
     if not TOKEN:
