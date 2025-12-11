@@ -1625,3 +1625,471 @@ async def send_eta(update: Update, ctx: ContextTypes.DEFAULT_TYPE, which: str):
         lines: List[str] = [f"<b>{h(load_id_text(job))}</b>"]
         stops: List[Tuple[str, str, List[str], Optional[str]]] = [
             ("PU", job["pu"]["addr"], job["pu"].get("lines") or [], job["pu"].get("time"))
+        ]
+        
+        for j, d in enumerate((job.get("del") or [])[:ETA_ALL_MAX]):
+            stops.append((f"D{j+1}", d["addr"], d.get("lines") or [], d.get("time")))
+
+        for lab, addr, lines2, appt in stops:
+            r = await eta_to(st, origin, lab, addr)
+            place = short_place(lines2, addr)
+            
+            if r.get("ok"):
+                arr = (now_utc().astimezone(tz) + timedelta(seconds=float(r["s"]))).strftime("%H:%M")
+                tag = " (approx)" if r.get("method") == "approx" else ""
+                appt_txt = f" · Appt: {appt}" if appt else ""
+                lines.append(
+                    f"<b>{h(lab)}:</b> <b>{h(fmt_dur(r['s']))}</b>{h(tag)} · "
+                    f"{h(fmt_mi(r['m']))} · ~{h(arr)}{h(appt_txt)} — {h(place)}"
+                )
+            else:
+                lines.append(f"<b>{h(lab)}:</b> ⚠️ {h(r.get('err'))} — {h(place)}")
+
+        await update.effective_message.reply_text(
+            "\n".join(lines), 
+            parse_mode="HTML", 
+            reply_markup=build_keyboard(job, st)
+        )
+        return
+
+    # Single stop ETA
+    stage, i = focus(job, st)
+    
+    if stage == "PU":
+        addr = job["pu"]["addr"]
+        lines2 = job["pu"].get("lines") or []
+        appt = job["pu"].get("time")
+        stop_label = "PU"
+    else:
+        dels = job.get("del") or []
+        d = dels[i] if dels else {"addr": "", "lines": [], "time": None}
+        addr = d["addr"]
+        lines2 = d.get("lines") or []
+        appt = d.get("time")
+        stop_label = f"DEL {i+1}/{len(dels)}" if dels else "DEL"
+
+    r = await eta_to(st, origin, stop_label, addr)
+    place = short_place(lines2, addr)
+
+    if r.get("ok"):
+        arr = (now_utc().astimezone(tz) + timedelta(seconds=float(r["s"]))).strftime("%H:%M")
+        tag = " (approx)" if r.get("method") == "approx" else ""
+        out = [
+            f"<b>⏱ ETA: {h(fmt_dur(r['s']))}</b>{h(tag)} — {h(stop_label)}",
+            f"{h(load_id_text(job))} · {h(place)}",
+            f"Arrive ~ {h(arr)} ({h(tz_now)}) · {h(fmt_mi(r['m']))}",
+        ]
+        if appt:
+            out.append(f"Appt: {h(appt)}")
+        
+        await update.effective_message.reply_text(
+            "\n".join(out), 
+            parse_mode="HTML", 
+            reply_markup=build_keyboard(job, st)
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"<b>{h(load_id_text(job))}</b>\n"
+            f"<b>⏱ ETA:</b> ⚠️ {h(r.get('err'))}\n"
+            f"<b>Target:</b> {h(place)}",
+            parse_mode="HTML",
+            reply_markup=build_keyboard(job, st),
+        )
+
+
+# ============================================================================
+# ADMIN TOOLS
+# ============================================================================
+
+async def deleteall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Delete recent messages in group (admin only)."""
+    async with _state_lock:
+        st = load_state()
+        
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.effective_message.reply_text(
+            "Bots can't clear a DM history. Delete the chat from your side."
+        )
+        return
+
+    n = DELETEALL_DEFAULT
+    if ctx.args:
+        try:
+            n = max(1, min(2000, int(ctx.args[0])))
+        except ValueError:
+            pass
+
+    notice = await update.effective_message.reply_text(
+        f"🧹 Deleting up to {n} messages… (bot must be admin)"
+    )
+    start_id = notice.message_id
+
+    for mid in range(start_id, max(1, start_id - n + 1) - 1, -1):
+        try:
+            await ctx.bot.delete_message(chat_id=chat.id, message_id=mid)
+        except (Forbidden, BadRequest):
+            break
+        await asyncio.sleep(0.02)
+
+
+async def leave_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Leave a group chat."""
+    async with _state_lock:
+        st = load_state()
+        
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+
+        chat = update.effective_chat
+        if not chat or chat.type == "private":
+            await update.effective_message.reply_text(
+                "Run /leave inside the group you want the bot to leave."
+            )
+            return
+
+        allowed = set(st.get("allowed_chats") or [])
+        allowed.discard(chat.id)
+        st["allowed_chats"] = sorted(list(allowed))
+        save_state(st)
+
+    await update.effective_message.reply_text("👋 Leaving this chat…")
+    
+    try:
+        await ctx.bot.leave_chat(chat.id)
+    except Exception as e:
+        log(f"Failed to leave chat: {e}")
+
+
+# ============================================================================
+# CALLBACK QUERY HANDLER
+# ============================================================================
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button callbacks."""
+    q = update.callback_query
+    if not q or not q.data:
+        return
+
+    data = q.data
+
+    async with _state_lock:
+        st = load_state()
+
+    if not chat_allowed(update, st):
+        await q.answer("Not allowed here.", show_alert=False)
+        return
+
+    # ETA requests
+    if data.startswith("ETA:"):
+        await q.answer("Computing ETA…", show_alert=False)
+        await send_eta(update, ctx, data.split(":", 1)[1])
+        return
+
+    # Catalog request
+    if data == "SHOW:CAT":
+        await send_catalog(update, ctx, from_callback=True)
+        return
+
+    # Finish job
+    if data == "JOB:FIN":
+        if not is_owner(update, st):
+            await q.answer("Owner only. DM /claim <code>.", show_alert=True)
+            return
+
+        await q.answer("Finishing…", show_alert=False)
+        out = await finish_active_load(update, ctx, source="callback")
+        if not out:
+            return
+        
+        rec, _ = out
+
+        rate_txt = money(rec.get("rate") if isinstance(rec.get("rate"), (int, float)) else None)
+        id_txt = rec.get("load_number") or rec.get("job_id") or ""
+        
+        await send_progress_alert(
+            ctx, 
+            update.effective_chat.id, 
+            f"✅ <b>Load finished</b> {h(id_txt)} · {h(rate_txt)}"
+        )
+
+        wk_count = int(rec.get("_wk_count") or 0)
+        wk_rate = float(rec.get("_wk_rate") or 0.0)
+        wk_miles = float(rec.get("_wk_miles") or 0.0)
+
+        report = "\n".join([
+            f"✅ <b>Load finished</b>",
+            f"{h(id_txt)} · {h(rate_txt)}",
+            f"Week {h(rec.get('week'))}: {h(wk_count)} loads · {h(money(wk_rate))} · {h(int(round(wk_miles)))} mi",
+            "📊 Tap Catalog for Excel.",
+        ])
+
+        try:
+            await q.edit_message_text(
+                text=report, 
+                parse_mode="HTML", 
+                reply_markup=build_finished_keyboard()
+            )
+        except TelegramError:
+            try:
+                await q.edit_message_reply_markup(reply_markup=build_finished_keyboard())
+            except TelegramError:
+                pass
+        return
+
+    # Progress button updates
+    async with _state_lock:
+        st2 = load_state()
+        job = normalize_job(st2.get("job"))
+        
+        if not job:
+            await q.answer("No active load.", show_alert=True)
+            try:
+                await q.edit_message_reply_markup(reply_markup=build_finished_keyboard())
+            except TelegramError:
+                pass
+            return
+
+        stage, i = focus(job, st2)
+        tz_name = ((st2.get("last_location") or {}).get("tz")) or "UTC"
+        ts = local_stamp(tz_name)
+        load_label = load_id_text(job)
+
+        progress_broadcast: Optional[str] = None
+
+        # Pickup actions
+        if data.startswith("PU:"):
+            ps = job["pu"]["status"]
+            
+            if data == "PU:A":
+                on = toggle_ts(ps, "arr")
+                if on:
+                    progress_broadcast = f"📍 <b>PU Arrived</b> — {h(ts)} — {h(load_label)}"
+            elif data == "PU:L":
+                on = toggle_ts(ps, "load")
+                if on:
+                    progress_broadcast = f"📦 <b>Loaded</b> — {h(ts)} — {h(load_label)}"
+            elif data == "PU:D":
+                on = toggle_ts(ps, "dep")
+                if on:
+                    progress_broadcast = f"🚚 <b>Departed PU</b> — {h(ts)} — {h(load_label)}"
+            elif data == "PU:C":
+                on = toggle_ts(ps, "comp")
+                if on:
+                    progress_broadcast = f"✅ <b>PU COMPLETE</b> — {h(ts)} — {h(load_label)}"
+                    ni = next_incomplete(job, 0)
+                    if ni is not None:
+                        st2["focus_i"] = ni
+
+        # Delivery actions
+        elif data.startswith("DEL:"):
+            if stage != "DEL":
+                await q.answer("Complete PU first.", show_alert=False)
+                return
+
+            dels = job.get("del") or []
+            if not dels:
+                await q.answer("No deliveries.", show_alert=False)
+                return
+
+            dd = dels[i]
+            ds = dd.get("status") or {}
+            lbl = f"DEL {i+1}/{len(dels)}"
+
+            if data == "DEL:A":
+                on = toggle_ts(ds, "arr")
+                if on:
+                    progress_broadcast = f"📍 <b>Arrived {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+            elif data == "DEL:DL":
+                on = toggle_ts(ds, "del")
+                if on:
+                    progress_broadcast = f"📦 <b>Delivered {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+            elif data == "DEL:D":
+                on = toggle_ts(ds, "dep")
+                if on:
+                    progress_broadcast = f"🚚 <b>Departed {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+            elif data == "DEL:C":
+                on = toggle_ts(ds, "comp")
+                if on:
+                    progress_broadcast = f"✅ <b>STOP COMPLETE {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+                    ni = next_incomplete(job, i + 1)
+                    if ni is not None:
+                        st2["focus_i"] = ni
+            elif data == "DEL:S":
+                ds["skip"] = True
+                if not ds.get("comp"):
+                    ds["comp"] = now_iso()
+                progress_broadcast = f"⏭️ <b>SKIPPED {h(lbl)}</b> — {h(ts)} — {h(load_label)}"
+                ni = next_incomplete(job, i + 1)
+                if ni is not None:
+                    st2["focus_i"] = ni
+
+            dd["status"] = ds
+            dels[i] = dd
+            job["del"] = dels
+
+        # Document toggles
+        elif data.startswith("DOC:"):
+            if data == "DOC:PTI":
+                job["pu"]["docs"]["pti"] = not bool(job["pu"]["docs"].get("pti"))
+            elif data == "DOC:BOL":
+                job["pu"]["docs"]["bol"] = not bool(job["pu"]["docs"].get("bol"))
+            elif data == "DOC:POD":
+                if stage != "DEL":
+                    await q.answer("Complete PU first.", show_alert=False)
+                    return
+                
+                dels = job.get("del") or []
+                if not dels:
+                    await q.answer("No deliveries.", show_alert=False)
+                    return
+                
+                dels[i].setdefault("docs", {})
+                dels[i]["docs"]["pod"] = not bool(dels[i]["docs"].get("pod"))
+                job["del"] = dels
+
+        st2["job"] = job
+        save_state(st2)
+
+    await q.answer("Updated.", show_alert=False)
+
+    if progress_broadcast:
+        await send_progress_alert(ctx, update.effective_chat.id, progress_broadcast)
+
+    try:
+        await q.edit_message_reply_markup(reply_markup=build_keyboard(job, st2))
+    except TelegramError:
+        pass
+
+
+# ============================================================================
+# TEXT MESSAGE HANDLER
+# ============================================================================
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle text messages (load detection and triggers)."""
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+
+    async with _state_lock:
+        st = load_state()
+
+    chat = update.effective_chat
+
+    # Detect new loads only in allowed groups
+    if chat and chat.type in ("group", "supergroup"):
+        if chat.id not in set(st.get("allowed_chats") or []):
+            return
+        
+        job = parse_job(msg.text)
+        if job:
+            async with _state_lock:
+                st2 = load_state()
+                st2["job"] = job
+                st2["focus_i"] = 0
+                save_state(st2)
+            
+            await msg.reply_text("📦 New load detected. Type eta / 1717 or /panel.")
+            return
+
+    # Trigger words in allowed chats
+    if not chat_allowed(update, st):
+        return
+
+    parts = msg.text.strip().split()
+    if not parts:
+        return
+
+    first = re.sub(r"^[^\w]+|[^\w]+$", "", parts[0].lower())
+    if first in TRIGGERS:
+        rest = " ".join(parts[1:]).lower()
+        which = "ALL" if "all" in rest else "AUTO"
+        await send_eta(update, ctx, which)
+
+
+# ============================================================================
+# STARTUP HOOK
+# ============================================================================
+
+async def _post_init(app):
+    """Post-initialization hook."""
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log(f"delete_webhook failed: {e}")
+    
+    try:
+        me = await app.bot.get_me()
+        log(f"Connected as @{me.username} (id {me.id})")
+    except Exception as e:
+        log(f"get_me failed: {e}")
+    
+    log("Ready.")
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def main() -> None:
+    """Main entry point."""
+    if not TOKEN:
+        raise RuntimeError("Missing TELEGRAM_TOKEN environment variable")
+
+    builder = ApplicationBuilder().token(TOKEN)
+    
+    try:
+        builder = builder.post_init(_post_init)
+    except Exception as e:
+        log(f"Failed to set post_init: {e}")
+
+    app = builder.build()
+
+    # Register command handlers
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("claim", claim_cmd))
+    app.add_handler(CommandHandler("allowhere", allowhere_cmd))
+    app.add_handler(CommandHandler("update", update_cmd))
+    app.add_handler(CommandHandler("panel", panel_cmd))
+    app.add_handler(CommandHandler("finish", finish_cmd))
+    app.add_handler(CommandHandler("catalog", catalog_cmd))
+    app.add_handler(CommandHandler("skip", skip_cmd))
+    app.add_handler(CommandHandler("deleteall", deleteall_cmd))
+    app.add_handler(CommandHandler("leave", leave_cmd))
+
+    # Register callback handler
+    app.add_handler(CallbackQueryHandler(on_callback))
+    
+    # Register location handlers
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
+    try:
+        app.add_handler(
+            MessageHandler(
+                filters.UpdateType.EDITED_MESSAGE & filters.LOCATION, 
+                on_location
+            )
+        )
+    except Exception as e:
+        log(f"Failed to add edited location handler: {e}")
+
+    # Register text handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    log("Starting polling…")
+    app.run_polling(
+        drop_pending_updates=True, 
+        allowed_updates=Update.ALL_TYPES, 
+        close_loop=False
+    )
+
+
+if __name__ == "__main__":
+    main()
