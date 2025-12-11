@@ -1,12 +1,12 @@
 """
 Telegram Trucker Dispatch Assistant Bot
-Version: 2025-12-11_v3 (Bulletproof Edition)
+Version: 2025-12-11_v4 (Multi-Geocoder Edition)
 
-Fixes:
-- Improved geocoding with multiple address variants
-- Fixed deleteall command (no longer deletes itself)
-- Better address parsing for multi-line formats
-- Enhanced error logging
+Features:
+- Multiple geocoding services (Nominatim + Photon fallback)
+- Enhanced address parsing and normalization
+- Detailed debug logging
+- Fixed deleteall command
 """
 
 import asyncio
@@ -48,7 +48,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "2025-12-11_v3"
+BOT_VERSION = "2025-12-11_v4"
 
 # ============================================================================
 # CONFIGURATION
@@ -86,7 +86,7 @@ STATE_FILE = Path(env_str("STATE_FILE", "state.json"))
 TRIGGERS = {t.strip().lower() for t in env_str("TRIGGERS", "eta,1717").split(",") if t.strip()}
 
 NOMINATIM_USER_AGENT = env_str("NOMINATIM_USER_AGENT", "dispatch-bot/1.0")
-NOMINATIM_MIN_INTERVAL = env_float("NOMINATIM_MIN_INTERVAL", 1.1)
+NOMINATIM_MIN_INTERVAL = env_float("NOMINATIM_MIN_INTERVAL", 1.2)
 
 ETA_ALL_MAX = env_int("ETA_ALL_MAX", 6)
 ALERT_TTL_SECONDS = env_int("ALERT_TTL_SECONDS", 25)
@@ -103,16 +103,41 @@ def log(msg: str):
     ts = datetime.now().strftime('%H:%M:%S')
     print(f"[{ts}] {msg}", flush=True)
 
+def log_debug(msg: str):
+    if DEBUG:
+        log(f"DEBUG: {msg}")
+
 def log_error(msg: str, exc: Exception = None):
     log(f"ERROR: {msg}")
-    if exc and DEBUG:
-        traceback.print_exc()
+    if exc:
+        log(f"  {type(exc).__name__}: {exc}")
+        if DEBUG:
+            traceback.print_exc()
 
 # ============================================================================
 # GLOBALS
 # ============================================================================
 TF = TimezoneFinder()
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+# Multiple geocoding endpoints for fallback
+GEOCODE_SERVICES = [
+    {
+        "name": "Nominatim",
+        "url": "https://nominatim.openstreetmap.org/search",
+        "params": lambda q: {"q": q, "format": "jsonv2", "limit": 1, "countrycodes": "us"},
+        "parse": lambda data: (float(data[0]["lat"]), float(data[0]["lon"])) if data else None,
+    },
+    {
+        "name": "Photon",
+        "url": "https://photon.komoot.io/api/",
+        "params": lambda q: {"q": q, "limit": 1, "lang": "en"},
+        "parse": lambda data: (
+            data["features"][0]["geometry"]["coordinates"][1],
+            data["features"][0]["geometry"]["coordinates"][0]
+        ) if data.get("features") else None,
+    },
+]
+
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
 
 _state_lock = asyncio.Lock()
@@ -197,7 +222,158 @@ def get_broadcast_chats(st: dict) -> List[int]:
     return chats
 
 # ============================================================================
-# IMPROVED GEOCODING - Multiple fallback strategies
+# ADDRESS NORMALIZATION
+# ============================================================================
+def normalize_address(addr: str) -> str:
+    """Normalize address for better geocoding."""
+    if not addr:
+        return ""
+    
+    # Uppercase for consistency
+    result = addr.upper().strip()
+    
+    # Remove company names / labels before the actual address
+    # Pattern: "COMPANY NAME, 123 Street..." or "COMPANY NAME - 123 Street..."
+    # Keep everything from the first number onward
+    num_match = re.search(r'(\d+\s+.+)', result)
+    if num_match:
+        result = num_match.group(1)
+    
+    # Normalize street types
+    replacements = [
+        (r'\bSTREET\b', 'ST'),
+        (r'\bAVENUE\b', 'AVE'),
+        (r'\bBOULEVARD\b', 'BLVD'),
+        (r'\bDRIVE\b', 'DR'),
+        (r'\bROAD\b', 'RD'),
+        (r'\bLANE\b', 'LN'),
+        (r'\bCOURT\b', 'CT'),
+        (r'\bPLACE\b', 'PL'),
+        (r'\bCIRCLE\b', 'CIR'),
+        (r'\bHIGHWAY\b', 'HWY'),
+        (r'\bPARKWAY\b', 'PKWY'),
+        (r'\bCENTER\b', 'CTR'),
+        (r'\bNORTH\b', 'N'),
+        (r'\bSOUTH\b', 'S'),
+        (r'\bEAST\b', 'E'),
+        (r'\bWEST\b', 'W'),
+    ]
+    
+    for pattern, repl in replacements:
+        result = re.sub(pattern, repl, result)
+    
+    # Clean up multiple spaces/commas
+    result = re.sub(r'\s+', ' ', result)
+    result = re.sub(r',\s*,', ',', result)
+    result = result.strip(' ,')
+    
+    return result
+
+def extract_address_components(addr: str) -> dict:
+    """Extract street, city, state, zip from address."""
+    components = {
+        "street": None,
+        "city": None,
+        "state": None,
+        "zip": None,
+        "original": addr,
+    }
+    
+    if not addr:
+        return components
+    
+    # Find ZIP code
+    zip_match = re.search(r'\b(\d{5})(?:-\d{4})?\b', addr)
+    if zip_match:
+        components["zip"] = zip_match.group(1)
+    
+    # Find state (2-letter code)
+    state_match = re.search(r'\b([A-Z]{2})\b(?:\s+\d{5})?(?:\s*,?\s*(?:USA|US)?)?$', addr.upper())
+    if state_match:
+        components["state"] = state_match.group(1)
+    
+    # Find street number + name
+    street_match = re.search(r'(\d+\s+[^,]+?)(?:,|\s+[A-Z]{2}\b)', addr, re.I)
+    if street_match:
+        components["street"] = street_match.group(1).strip()
+    
+    # Find city (usually before state)
+    if components["state"]:
+        city_match = re.search(r'([A-Za-z\s]+),?\s*' + components["state"], addr, re.I)
+        if city_match:
+            city = city_match.group(1).strip()
+            # Make sure it's not the street
+            if city and components["street"] and city not in components["street"]:
+                components["city"] = city
+            elif city and not components["street"]:
+                components["city"] = city
+    
+    return components
+
+def generate_address_variants(addr: str) -> List[str]:
+    """Generate multiple address variants for geocoding attempts."""
+    if not addr:
+        return []
+    
+    variants = []
+    
+    # Normalize the address first
+    normalized = normalize_address(addr)
+    components = extract_address_components(normalized)
+    
+    log_debug(f"Address components: {components}")
+    
+    # Build variants from most specific to least
+    
+    # 1. Full normalized address
+    if normalized:
+        variants.append(normalized)
+        variants.append(f"{normalized}, USA")
+    
+    # 2. Street + City + State + ZIP
+    if all([components["street"], components["city"], components["state"]]):
+        full = f"{components['street']}, {components['city']}, {components['state']}"
+        variants.append(full)
+        variants.append(f"{full}, USA")
+        if components["zip"]:
+            variants.append(f"{full} {components['zip']}")
+    
+    # 3. Street + City + State (without zip)
+    if components["street"] and components["state"]:
+        variants.append(f"{components['street']}, {components['state']}")
+        variants.append(f"{components['street']}, {components['state']}, USA")
+    
+    # 4. City + State
+    if components["city"] and components["state"]:
+        variants.append(f"{components['city']}, {components['state']}")
+        variants.append(f"{components['city']}, {components['state']}, USA")
+    
+    # 5. ZIP code alone (very reliable)
+    if components["zip"]:
+        variants.append(components["zip"])
+    
+    # 6. Try original with USA
+    if addr and "USA" not in addr.upper():
+        variants.append(f"{addr}, USA")
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique = []
+    for v in variants:
+        v_clean = " ".join(v.split()).strip()
+        v_key = v_clean.lower()
+        if v_key and v_key not in seen and len(v_clean) >= 3:
+            seen.add(v_key)
+            unique.append(v_clean)
+    
+    log_debug(f"Generated {len(unique)} address variants")
+    for i, v in enumerate(unique[:5]):
+        log_debug(f"  Variant {i+1}: {v}")
+    
+    return unique
+
+# ============================================================================
+# MULTI-SERVICE GEOCODING
 # ============================================================================
 def haversine_miles(lat1, lon1, lat2, lon2) -> float:
     R = 3958.8
@@ -209,120 +385,59 @@ def haversine_miles(lat1, lon1, lat2, lon2) -> float:
 def haversine_meters(lat1, lon1, lat2, lon2) -> float:
     return haversine_miles(lat1, lon1, lat2, lon2) * METERS_PER_MILE
 
-def generate_address_variants(addr: str) -> List[str]:
-    """Generate multiple address variants for geocoding - bulletproof approach."""
-    if not addr:
-        return []
-    
-    variants = []
-    addr = addr.strip()
-    
-    # 1. Original address
-    variants.append(addr)
-    
-    # 2. Original + USA
-    if "USA" not in addr.upper():
-        variants.append(f"{addr}, USA")
-    
-    # 3. Split by comma and try combinations
-    parts = [p.strip() for p in addr.split(",") if p.strip()]
-    
-    if len(parts) >= 2:
-        # Without first part (often company name like "MODERN")
-        without_first = ", ".join(parts[1:])
-        variants.append(without_first)
-        variants.append(f"{without_first}, USA")
+async def geocode_with_service(client: httpx.AsyncClient, service: dict, query: str) -> Optional[Tuple[float, float]]:
+    """Try geocoding with a specific service."""
+    try:
+        r = await client.get(service["url"], params=service["params"](query))
+        log_debug(f"  {service['name']}: HTTP {r.status_code}")
         
-        # Last 2 parts (usually city, state or state zip)
-        last_two = ", ".join(parts[-2:])
-        variants.append(last_two)
-        
-        # Last 3 parts
-        if len(parts) >= 3:
-            last_three = ", ".join(parts[-3:])
-            variants.append(last_three)
-            variants.append(f"{last_three}, USA")
+        if r.status_code == 200:
+            data = r.json()
+            result = service["parse"](data)
+            if result:
+                log_debug(f"  {service['name']}: Found {result[0]:.4f}, {result[1]:.4f}")
+                return result
+            else:
+                log_debug(f"  {service['name']}: No results in response")
+        elif r.status_code == 429:
+            log(f"  {service['name']}: Rate limited (429)")
+        else:
+            log_debug(f"  {service['name']}: HTTP {r.status_code}")
+            
+    except httpx.TimeoutException:
+        log(f"  {service['name']}: Timeout")
+    except Exception as e:
+        log_error(f"  {service['name']}: Error", e)
     
-    # 4. Extract street number + street + city + state pattern
-    # Handle "310 WEST WASHINGTON STREET NORRISTOWN, PA"
-    street_pattern = re.search(
-        r'(\d+\s+(?:[NSEW]\s+)?[\w\s]+(?:ST|STREET|AVE|AVENUE|BLVD|BOULEVARD|RD|ROAD|DR|DRIVE|LN|LANE|CT|COURT|WAY|PL|PLACE|HWY|HIGHWAY|PKWY|PARKWAY))[,\s]+([^,]+)[,\s]+([A-Z]{2})(?:\s+(\d{5}))?',
-        addr.upper()
-    )
-    if street_pattern:
-        street = street_pattern.group(1).strip()
-        city = street_pattern.group(2).strip()
-        state = street_pattern.group(3).strip()
-        zipcode = street_pattern.group(4) or ""
-        
-        # Normalize street abbreviations
-        street = re.sub(r'\bSTREET\b', 'ST', street)
-        street = re.sub(r'\bAVENUE\b', 'AVE', street)
-        street = re.sub(r'\bBOULEVARD\b', 'BLVD', street)
-        street = re.sub(r'\bDRIVE\b', 'DR', street)
-        street = re.sub(r'\bROAD\b', 'RD', street)
-        
-        variants.append(f"{street}, {city}, {state}")
-        variants.append(f"{street}, {city}, {state}, USA")
-        if zipcode:
-            variants.append(f"{street}, {city}, {state} {zipcode}")
-            variants.append(f"{street}, {city}, {state} {zipcode}, USA")
-        
-        # Just city, state
-        variants.append(f"{city}, {state}")
-        variants.append(f"{city}, {state}, USA")
-    
-    # 5. Try to find just city, state anywhere in address
-    city_state = re.search(r'([A-Za-z\s]+),\s*([A-Z]{2})(?:\s+\d{5})?', addr)
-    if city_state:
-        city = city_state.group(1).strip()
-        state = city_state.group(2).strip()
-        if len(city) > 2:  # Not just abbreviation
-            variants.append(f"{city}, {state}")
-            variants.append(f"{city}, {state}, USA")
-    
-    # 6. Look for ZIP code and use that
-    zip_match = re.search(r'\b(\d{5})\b', addr)
-    if zip_match:
-        variants.append(zip_match.group(1))
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique = []
-    for v in variants:
-        v_clean = " ".join(v.split()).strip()
-        v_lower = v_clean.lower()
-        if v_lower and v_lower not in seen and len(v_clean) > 3:
-            seen.add(v_lower)
-            unique.append(v_clean)
-    
-    if DEBUG:
-        log(f"Address variants for '{addr[:40]}': {len(unique)} variants")
-    
-    return unique
+    return None
 
 async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
-    """Geocode with multiple fallback variants."""
+    """Geocode with multiple services and fallbacks."""
     if not addr:
+        log_debug("Geocode: Empty address")
         return None
     
-    # Check cache
-    if addr in cache:
-        c = cache[addr]
+    # Check cache first
+    cache_key = addr.lower().strip()
+    if cache_key in cache:
+        c = cache[cache_key]
+        log_debug(f"Geocode: Cache hit")
         return c["lat"], c["lon"], c.get("tz", "UTC")
-    
-    if not NOMINATIM_USER_AGENT:
-        log("Geocode: No user agent configured")
-        return None
     
     variants = generate_address_variants(addr)
     if not variants:
+        log("Geocode: No variants generated")
         return None
     
-    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+    headers = {
+        "User-Agent": NOMINATIM_USER_AGENT or "DispatchBot/1.0",
+        "Accept": "application/json",
+    }
     
-    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        for i, query in enumerate(variants[:10]):  # Try up to 10 variants
+    async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
+        for variant in variants[:6]:  # Try up to 6 variants
+            log_debug(f"Geocode trying: {variant}")
+            
             # Rate limiting
             async with _geo_lock:
                 global _geo_last
@@ -331,38 +446,24 @@ async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
                     await asyncio.sleep(wait)
                 _geo_last = time.monotonic()
             
-            try:
-                if DEBUG:
-                    log(f"Geocode [{i+1}/{len(variants)}]: {query[:50]}")
+            # Try each geocoding service
+            for service in GEOCODE_SERVICES:
+                result = await geocode_with_service(client, service, variant)
                 
-                r = await client.get(
-                    NOMINATIM_URL,
-                    params={
-                        "q": query,
-                        "format": "jsonv2",
-                        "limit": 1,
-                        "countrycodes": "us",
-                    }
-                )
+                if result:
+                    lat, lon = result
+                    tz = TF.timezone_at(lat=lat, lng=lon) or "UTC"
+                    
+                    # Cache the result
+                    cache[cache_key] = {"lat": lat, "lon": lon, "tz": tz}
+                    
+                    log(f"Geocode SUCCESS via {service['name']}: {lat:.4f}, {lon:.4f}")
+                    return lat, lon, tz
                 
-                if r.status_code == 200:
-                    data = r.json()
-                    if data and len(data) > 0:
-                        lat = float(data[0]["lat"])
-                        lon = float(data[0]["lon"])
-                        display = data[0].get("display_name", "")
-                        tz = TF.timezone_at(lat=lat, lng=lon) or "UTC"
-                        
-                        # Cache result
-                        cache[addr] = {"lat": lat, "lon": lon, "tz": tz, "display": display}
-                        
-                        log(f"Geocode SUCCESS: {lat:.4f}, {lon:.4f}")
-                        return lat, lon, tz
-                        
-            except Exception as e:
-                log_error(f"Geocode error for '{query[:30]}'", e)
+                # Small delay between services
+                await asyncio.sleep(0.3)
     
-    log(f"Geocode FAILED: No results for '{addr[:40]}'")
+    log(f"Geocode FAILED: All variants and services exhausted for '{addr[:40]}'")
     return None
 
 async def get_route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optional[Tuple[float, float]]:
@@ -376,6 +477,7 @@ async def get_route(origin: Tuple[float, float], dest: Tuple[float, float]) -> O
                 data = r.json()
                 if data.get("code") == "Ok" and data.get("routes"):
                     rt = data["routes"][0]
+                    log_debug(f"Route: {rt['distance']/1609:.1f} mi, {rt['duration']/60:.0f} min")
                     return rt["distance"], rt["duration"]
     except Exception as e:
         log_error("Route error", e)
@@ -391,7 +493,7 @@ async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
     geo = await geocode(addr, cache)
     
     if not geo:
-        return {"ok": False, "err": f"Location not found"}
+        return {"ok": False, "err": f"Could not locate address"}
     
     dest = (geo[0], geo[1])
     route = await get_route(origin, dest)
@@ -409,9 +511,8 @@ async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
     dist_m = haversine_meters(origin[0], origin[1], dest[0], dest[1])
     dist_mi = dist_m / METERS_PER_MILE
     
-    # Speed based on distance
     speed_mph = 35 if dist_mi < 50 else (50 if dist_mi < 150 else 60)
-    est_secs = (dist_mi / speed_mph) * 3600 * 1.2  # 20% buffer
+    est_secs = (dist_mi / speed_mph) * 3600 * 1.2
     
     return {
         "ok": True,
@@ -422,7 +523,7 @@ async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
     }
 
 # ============================================================================
-# IMPROVED LOAD PARSING
+# LOAD PARSING
 # ============================================================================
 LOAD_NUM_PATTERN = re.compile(r"Load\s*#\s*(\S+)", re.I)
 RATE_PATTERN = re.compile(r"Rate\s*:\s*\$?([\d,]+(?:\.\d{2})?)", re.I)
@@ -433,7 +534,7 @@ PU_ADDR_PATTERN = re.compile(r"PU\s*Address\s*:\s*(.+?)(?=\n\s*\n|\nDEL|\n-{3,}|
 DEL_ADDR_PATTERN = re.compile(r"DEL\s*Address\s*:\s*(.+?)(?=\n\s*\n|\n-{3,}|\nTotal|$)", re.I | re.S)
 
 def clean_address(addr: str) -> str:
-    """Clean address - join multi-line addresses properly."""
+    """Clean address from load sheet."""
     if not addr:
         return ""
     
@@ -443,7 +544,6 @@ def clean_address(addr: str) -> str:
         if not ln or len(ln) < 2:
             continue
         
-        # Stop markers
         ln_lower = ln.lower()
         if any(skip in ln_lower for skip in ["---", "===", "total mi", "rate :", "trailer", "failure"]):
             break
@@ -453,24 +553,15 @@ def clean_address(addr: str) -> str:
     if not lines:
         return ""
     
-    # Smart join - detect if line is continuation
-    result = []
-    for i, ln in enumerate(lines):
-        if i == 0:
-            result.append(ln)
-        elif re.match(r'^\d+\s', ln):
-            # Starts with number (street address)
-            result.append(ln)
-        elif re.match(r'^[A-Z]{2}\s*\d{5}', ln):
-            # State + ZIP
-            result.append(ln)
-        elif result and not result[-1].rstrip().endswith(','):
-            # Continuation - append with space
-            result[-1] = result[-1].rstrip() + ' ' + ln
-        else:
-            result.append(ln)
+    # Join lines, preserving structure
+    # First line might be company name, rest is address
+    result = ", ".join(lines)
     
-    return ", ".join(result)
+    # Clean up
+    result = re.sub(r'\s+', ' ', result)
+    result = re.sub(r',\s*,', ',', result)
+    
+    return result.strip()
 
 def parse_load(text: str) -> Optional[dict]:
     """Parse load from dispatcher message."""
@@ -491,7 +582,6 @@ def parse_load(text: str) -> Optional[dict]:
     if m:
         try:
             rate = float(m.group(1).replace(",", ""))
-            log(f"  Rate: ${rate}")
         except: pass
     
     miles = None
@@ -499,7 +589,6 @@ def parse_load(text: str) -> Optional[dict]:
     if m:
         try:
             miles = int(m.group(1).replace(",", ""))
-            log(f"  Miles: {miles}")
         except: pass
     
     pu_time = None
@@ -747,10 +836,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 • Forward load sheet → auto-detects
 • Type <code>eta</code> or <code>1717</code>
 • /panel for controls
-• /finish when done
 
-<b>Commands:</b>
-/clearcache - Reset geocoding if stuck"""
+<b>Debug:</b>
+/testgeo &lt;address&gt; - Test geocoding
+/clearcache - Reset address cache"""
     
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -780,9 +869,53 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 • Location: {loc_info}
 • Active load: {load_label(job) if job else '❌ None'}
 • History: {len(st.get('history', []))} loads
-• Cache: {len(gc)} addresses"""
+• Cache: {len(gc)} addresses
+• Debug: {'ON' if DEBUG else 'OFF'}"""
     
     await update.message.reply_text(text, parse_mode="HTML")
+
+async def cmd_testgeo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Test geocoding for an address."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    if not ctx.args:
+        await update.message.reply_text("Usage: /testgeo <address>")
+        return
+    
+    addr = " ".join(ctx.args)
+    await update.message.reply_text(f"🔍 Testing: {addr}\n\nPlease wait...")
+    
+    cache = {}  # Fresh cache for test
+    geo = await geocode(addr, cache)
+    
+    if geo:
+        lat, lon, tz = geo
+        await update.message.reply_text(
+            f"✅ <b>Geocode SUCCESS</b>\n\n"
+            f"📍 {lat:.6f}, {lon:.6f}\n"
+            f"🕐 Timezone: {tz}\n\n"
+            f"<a href=\"https://www.google.com/maps?q={lat},{lon}\">Open in Google Maps</a>",
+            parse_mode="HTML"
+        )
+        # Send location pin
+        try:
+            await ctx.bot.send_location(update.effective_chat.id, lat, lon)
+        except: pass
+    else:
+        # Show what variants were tried
+        variants = generate_address_variants(addr)
+        variant_list = "\n".join(f"• {v}" for v in variants[:6])
+        await update.message.reply_text(
+            f"❌ <b>Geocode FAILED</b>\n\n"
+            f"Tried variants:\n{variant_list}\n\n"
+            f"All services returned no results.",
+            parse_mode="HTML"
+        )
 
 async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != "private":
@@ -974,7 +1107,7 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏭ Skipped stop {idx+1}")
 
 async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """FIXED: Delete messages without deleting itself."""
+    """Delete messages - doesn't delete itself."""
     async with _state_lock:
         st = load_state()
     
@@ -995,15 +1128,12 @@ async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     n = max(1, min(n, 2000))
     
     cmd_msg_id = update.message.message_id
-    
-    # Send status
     status_msg = await update.message.reply_text(f"🧹 Deleting up to {n} messages...")
     status_msg_id = status_msg.message_id
     
     deleted = 0
     failed = 0
     
-    # Delete messages BEFORE the command (not command or status)
     for mid in range(cmd_msg_id - 1, max(0, cmd_msg_id - n - 1), -1):
         try:
             await ctx.bot.delete_message(chat.id, mid)
@@ -1021,12 +1151,10 @@ async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if failed > 30:
                 break
     
-    # Delete command message
     try:
         await ctx.bot.delete_message(chat.id, cmd_msg_id)
     except: pass
     
-    # Update and delete status after delay
     try:
         await status_msg.edit_text(f"✅ Deleted {deleted} messages")
         await asyncio.sleep(3)
@@ -1120,7 +1248,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with _state_lock:
         st = load_state()
     
-    # Detect loads in groups
     if chat and chat.type in ("group", "supergroup"):
         if chat.id not in (st.get("allowed_chats") or []):
             return
@@ -1150,7 +1277,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             return
     
-    # Check triggers
     if not chat_allowed(update, st):
         return
     
@@ -1170,9 +1296,8 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     data = query.data
-    log(f"Callback: {data}")
+    log_debug(f"Callback: {data}")
     
-    # Answer immediately
     await query.answer()
     
     async with _state_lock:
@@ -1354,7 +1479,6 @@ async def send_eta_response(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: 
     tz_name = loc.get("tz", "UTC")
     tz = safe_tz(tz_name)
     
-    # Send location
     try:
         await ctx.bot.send_location(update.effective_chat.id, origin[0], origin[1])
     except: pass
@@ -1401,7 +1525,6 @@ async def send_all_etas(update, ctx, st, job, origin, tz, tz_name, age_warn=""):
             else:
                 lines.append(f"<b>D{i+1}:</b> ⚠️ {eta['err']}")
     
-    # Save cache
     async with _state_lock:
         st2 = load_state()
         st2["geocode_cache"] = st.get("geocode_cache", {})
@@ -1428,7 +1551,6 @@ async def send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn=""
     
     eta = await calc_eta(st, origin, addr)
     
-    # Save cache
     async with _state_lock:
         st2 = load_state()
         st2["geocode_cache"] = st.get("geocode_cache", {})
@@ -1455,7 +1577,9 @@ async def send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn=""
         )
     else:
         await update.effective_message.reply_text(
-            f"⚠️ <b>Could not calculate ETA</b>\n{eta['err']}\n\n📍 {h(short_addr(addr, 45))}\n\nTry /clearcache",
+            f"⚠️ <b>Could not calculate ETA</b>\n{eta['err']}\n\n"
+            f"📍 {h(short_addr(addr, 45))}\n\n"
+            f"Try: /testgeo {addr[:30]}",
             parse_mode="HTML",
             reply_markup=build_panel_keyboard(job, st)
         )
@@ -1682,6 +1806,7 @@ async def post_init(app: Application):
         app.job_queue.run_repeating(geofence_job, interval=30, first=15)
     
     log(f"Ready! v{BOT_VERSION}")
+    log(f"Geocoders: {', '.join(s['name'] for s in GEOCODE_SERVICES)}")
 
 def main():
     if not TOKEN:
@@ -1696,6 +1821,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("testgeo", cmd_testgeo))
     app.add_handler(CommandHandler("claim", cmd_claim))
     app.add_handler(CommandHandler("allowhere", cmd_allowhere))
     app.add_handler(CommandHandler("update", cmd_update))
