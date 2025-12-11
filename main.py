@@ -48,7 +48,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "5.0"
+BOT_VERSION = "6.0"
 
 # ============================================================================
 # CONFIGURATION
@@ -96,6 +96,24 @@ GEOFENCE_MILES = env_float("GEOFENCE_MILES", 5.0)
 REMINDER_DOC_AFTER_MIN = env_int("REMINDER_DOC_AFTER_MIN", 15)
 REMINDER_THRESHOLDS_MIN = env_list_int("REMINDER_THRESHOLDS_MIN", [60, 30, 10])
 SCHEDULE_GRACE_MIN = env_int("SCHEDULE_GRACE_MIN", 30)
+
+# New feature settings
+DETENTION_ALERT_MINUTES = env_int("DETENTION_ALERT_MINUTES", 120)  # Alert after 2 hours
+FUEL_PRICE_DEFAULT = env_float("FUEL_PRICE_DEFAULT", 3.50)  # $/gallon
+TRUCK_MPG = env_float("TRUCK_MPG", 6.5)  # Miles per gallon
+WEEKLY_SUMMARY_DAY = env_int("WEEKLY_SUMMARY_DAY", 6)  # 0=Mon, 6=Sun
+WEEKLY_SUMMARY_HOUR = env_int("WEEKLY_SUMMARY_HOUR", 20)  # 8 PM
+
+# Quick reply templates
+QUICK_REPLIES = {
+    "loaded": "✅ Loaded and secured. Departing shortly.",
+    "arrived": "📍 Arrived at facility. Checking in now.",
+    "running_late": "⚠️ Running approximately {mins} minutes behind schedule. Will update with new ETA.",
+    "need_lumper": "📦 Lumper required at this facility. Please advise on payment method.",
+    "delayed": "⏳ Experiencing delay at facility. Currently waiting.",
+    "empty": "🚛 Trailer empty and swept. Ready for next load.",
+    "issue": "⚠️ Issue encountered. Please call when available.",
+}
 
 DEBUG = env_bool("DEBUG", True)
 
@@ -225,6 +243,76 @@ def progress_bar(current: int, total: int, width: int = 10) -> str:
         return "░" * width
     filled = int((current / total) * width)
     return "▓" * filled + "░" * (width - filled)
+
+# ============================================================================
+# FUEL & COST CALCULATIONS
+# ============================================================================
+def calc_fuel_cost(miles: float, mpg: float = None, price_per_gal: float = None) -> dict:
+    """Calculate estimated fuel cost for a trip."""
+    mpg = mpg or TRUCK_MPG
+    price = price_per_gal or FUEL_PRICE_DEFAULT
+    
+    gallons = miles / mpg
+    cost = gallons * price
+    
+    return {
+        "miles": miles,
+        "gallons": round(gallons, 1),
+        "cost": round(cost, 2),
+        "mpg": mpg,
+        "price_per_gal": price,
+    }
+
+def calc_net_revenue(rate: float, miles: float, deadhead: float = 0, fuel_price: float = None) -> dict:
+    """Calculate net revenue after fuel."""
+    total_miles = miles + deadhead
+    fuel = calc_fuel_cost(total_miles, price_per_gal=fuel_price)
+    
+    net = rate - fuel["cost"]
+    rpm_loaded = rate / miles if miles > 0 else 0
+    rpm_total = rate / total_miles if total_miles > 0 else 0
+    
+    return {
+        "gross": rate,
+        "fuel_cost": fuel["cost"],
+        "fuel_gallons": fuel["gallons"],
+        "net": round(net, 2),
+        "miles_loaded": miles,
+        "miles_deadhead": deadhead,
+        "miles_total": total_miles,
+        "rpm_loaded": round(rpm_loaded, 2),
+        "rpm_total": round(rpm_total, 2),
+    }
+
+# ============================================================================
+# DETENTION TRACKING
+# ============================================================================
+def calc_detention(arrival_time: str) -> Optional[dict]:
+    """Calculate detention time from arrival timestamp."""
+    if not arrival_time:
+        return None
+    
+    try:
+        arr = datetime.fromisoformat(arrival_time)
+        elapsed = now_utc() - arr
+        mins = int(elapsed.total_seconds() / 60)
+        
+        return {
+            "minutes": mins,
+            "hours": mins / 60,
+            "formatted": fmt_dur(elapsed.total_seconds()),
+            "alert": mins >= DETENTION_ALERT_MINUTES,
+        }
+    except:
+        return None
+
+def format_detention(det: dict) -> str:
+    """Format detention info for display."""
+    if not det:
+        return ""
+    
+    icon = "🚨" if det["alert"] else "⏱"
+    return f"{icon} On site: {det['formatted']}"
 
 # ============================================================================
 # STATE MANAGEMENT
@@ -934,6 +1022,7 @@ def parse_load(text: str) -> Optional[dict]:
             "load_number": load_num,
             "rate": rate,
             "miles": miles,
+            "deadhead": None,  # Set via /deadhead command
             "refs": refs if refs else None,
         },
         "pu": {
@@ -950,6 +1039,7 @@ def parse_load(text: str) -> Optional[dict]:
             "status": {"arr": None, "del": None, "dep": None, "comp": None, "skip": False},
             "docs": {"pod": False},
         }],
+        "photos": [],  # Store photo file_ids with labels
     }
     
     # Log what we found
@@ -1090,16 +1180,55 @@ def build_panel_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
                     nav.append(btn("Next ▶", f"NAV:{idx+1}"))
                 rows.append(nav)
     
-    # Bottom action row
+    # Bottom action rows
     rows.append([
         btn("🧭 ETA", "ETA:ONE"),
         btn("📍 All ETAs", "ETA:ALL"),
     ])
     rows.append([
-        btn("📊 Catalog", "CATALOG"),
+        btn("💵 Costs", "COSTS"),
+        btn("📸 Photos", "PHOTOS"),
+    ])
+    rows.append([
+        btn("💬 Quick Reply", "QUICKREPLY"),
         btn("🏁 Finish", "FINISH"),
     ])
     
+    return InlineKeyboardMarkup(rows)
+
+def build_quick_reply_keyboard() -> InlineKeyboardMarkup:
+    """Build keyboard for quick dispatch replies."""
+    rows = [
+        [btn("✅ Loaded", "QR:loaded"), btn("📍 Arrived", "QR:arrived")],
+        [btn("⚠️ Running Late", "QR:running_late"), btn("📦 Need Lumper", "QR:need_lumper")],
+        [btn("⏳ Delayed", "QR:delayed"), btn("🚛 Empty", "QR:empty")],
+        [btn("⚠️ Issue - Call Me", "QR:issue")],
+        [btn("« Back", "PANEL")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def build_photos_keyboard(job: dict) -> InlineKeyboardMarkup:
+    """Build keyboard for photo management."""
+    photos = job.get("photos", [])
+    rows = [
+        [btn("📸 Add BOL Photo", "PHOTO:bol"), btn("📸 Add POD Photo", "PHOTO:pod")],
+        [btn("📸 Add Damage Photo", "PHOTO:damage"), btn("📸 Add Seal Photo", "PHOTO:seal")],
+        [btn("📸 Add Freight Photo", "PHOTO:freight")],
+    ]
+    
+    if photos:
+        rows.append([btn(f"📂 View {len(photos)} Photos", "PHOTO:view")])
+    
+    rows.append([btn("« Back", "PANEL")])
+    return InlineKeyboardMarkup(rows)
+
+def build_costs_keyboard() -> InlineKeyboardMarkup:
+    """Build keyboard for cost/revenue view."""
+    rows = [
+        [btn("⛽ Set Fuel Price", "COST:fuel"), btn("🛣 Set Deadhead", "COST:deadhead")],
+        [btn("📊 Full Breakdown", "COST:breakdown")],
+        [btn("« Back", "PANEL")],
+    ]
     return InlineKeyboardMarkup(rows)
 
 def build_done_keyboard() -> InlineKeyboardMarkup:
@@ -1199,7 +1328,7 @@ def build_start_message() -> str:
 <b>🚛 DISPATCH ASSISTANT</b>
 <code>━━━━━━━━━━━━━━━━━━━━━━</code>
 
-Welcome! I help track your loads, calculate ETAs, and manage documentation.
+Welcome! I help track your loads, ETAs, costs, and documentation.
 
 <b>⚡ QUICK START</b>
 <code>┌────────────────────────┐</code>
@@ -1210,13 +1339,19 @@ Welcome! I help track your loads, calculate ETAs, and manage documentation.
 <code>└────────────────────────┘</code>
 
 <b>📱 COMMANDS</b>
-• <code>eta</code> or <code>1717</code> — Get ETA
+• <code>eta</code> — Get ETA to next stop
 • /panel — Control panel
-• /catalog — Weekly report
-• /finish — Complete load
+• /costs — Fuel & profit breakdown
+• /photos — Save load photos
+• /weekly — Weekly summary
+• /reply — Quick dispatch messages
+
+<b>⚙️ SETTINGS</b>
+• /fuel <price> — Set fuel price
+• /deadhead <miles> — Set empty miles
 
 <code>━━━━━━━━━━━━━━━━━━━━━━</code>
-<i>v{BOT_VERSION} • Powered by OSRM</i>
+<i>v{BOT_VERSION}</i>
 """
 
 def build_status_message(st: dict, update: Update) -> str:
@@ -1521,6 +1656,174 @@ def build_alert_message(icon: str, title: str, detail: str = "", timestamp: str 
     if timestamp:
         lines.append(f"<i>{timestamp}</i>")
     return "\n".join(lines)
+
+def build_costs_message(job: dict, st: dict) -> str:
+    """Build cost breakdown message."""
+    meta = job.get("meta", {})
+    rate = meta.get("rate", 0) or 0
+    miles = meta.get("miles", 0) or 0
+    deadhead = meta.get("deadhead", 0) or 0
+    fuel_price = st.get("fuel_price") or FUEL_PRICE_DEFAULT
+    
+    if not rate or not miles:
+        return """
+<b>💵 COST BREAKDOWN</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+⚠️ Need rate and miles to calculate.
+"""
+    
+    breakdown = calc_net_revenue(rate, miles, deadhead, fuel_price)
+    
+    lines = [
+        f"<b>💵 COST BREAKDOWN</b>",
+        f"<code>━━━━━━━━━━━━━━━━━━━━━━</code>",
+        f"",
+        f"<b>{load_label(job)}</b>",
+        f"",
+        f"<b>Revenue</b>",
+        f"  Gross:          {money(breakdown['gross'])}",
+        f"",
+        f"<b>Miles</b>",
+        f"  Loaded:         {breakdown['miles_loaded']} mi",
+    ]
+    
+    if deadhead > 0:
+        lines.append(f"  Deadhead:       {breakdown['miles_deadhead']} mi")
+        lines.append(f"  Total:          {breakdown['miles_total']} mi")
+    
+    lines.extend([
+        f"",
+        f"<b>Fuel Estimate</b>",
+        f"  Gallons:        ~{breakdown['fuel_gallons']} gal",
+        f"  @ ${fuel_price:.2f}/gal:    -{money(breakdown['fuel_cost'])}",
+        f"",
+        f"<code>━━━━━━━━━━━━━━━━━━━━━━</code>",
+        f"<b>Net Revenue:     {money(breakdown['net'])}</b>",
+        f"",
+        f"$/mi (loaded):   ${breakdown['rpm_loaded']:.2f}",
+    ])
+    
+    if deadhead > 0:
+        lines.append(f"$/mi (total):    ${breakdown['rpm_total']:.2f}")
+    
+    return "\n".join(lines)
+
+def build_photos_message(job: dict) -> str:
+    """Build photo gallery message."""
+    photos = job.get("photos", [])
+    
+    lines = [
+        f"<b>📸 LOAD PHOTOS</b>",
+        f"<code>━━━━━━━━━━━━━━━━━━━━━━</code>",
+        f"",
+        f"<b>{load_label(job)}</b>",
+        f"",
+    ]
+    
+    if not photos:
+        lines.append("<i>No photos saved yet.</i>")
+        lines.append("")
+        lines.append("Tap a button to save a photo.")
+    else:
+        lines.append(f"<b>{len(photos)} photos saved:</b>")
+        for i, p in enumerate(photos, 1):
+            label = p.get("label", "Photo").upper()
+            timestamp = p.get("time", "")
+            if timestamp:
+                try:
+                    dt = datetime.fromisoformat(timestamp)
+                    timestamp = dt.strftime("%m/%d %I:%M %p")
+                except:
+                    pass
+            lines.append(f"  {i}. {label} - {timestamp}")
+    
+    return "\n".join(lines)
+
+def build_quick_reply_message() -> str:
+    """Build quick reply selection message."""
+    return """
+<b>💬 QUICK REPLIES</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Select a message to copy to clipboard:
+"""
+
+def build_weekly_summary(st: dict) -> str:
+    """Build weekly summary message."""
+    tz_name = (st.get("last_location") or {}).get("tz", "UTC")
+    tz = safe_tz(tz_name)
+    now = now_utc().astimezone(tz)
+    wk = week_key(now)
+    
+    history = st.get("history", [])
+    week_records = [r for r in history if r.get("week") == wk]
+    
+    if not week_records:
+        return f"""
+<b>📊 WEEKLY SUMMARY</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+Week {wk}
+No loads completed this week.
+"""
+    
+    total_rate = sum(r.get("rate", 0) or 0 for r in week_records)
+    total_miles = sum(r.get("posted_miles", 0) or 0 for r in week_records)
+    total_deadhead = sum(r.get("deadhead", 0) or 0 for r in week_records)
+    
+    avg_rpm = total_rate / total_miles if total_miles else 0
+    
+    # Find best load
+    best = max(week_records, key=lambda r: (r.get("rate", 0) or 0) / (r.get("posted_miles", 1) or 1))
+    best_rpm = (best.get("rate", 0) or 0) / (best.get("posted_miles", 1) or 1)
+    
+    # Estimate fuel cost
+    total_all_miles = total_miles + total_deadhead
+    fuel_est = calc_fuel_cost(total_all_miles, price_per_gal=st.get("fuel_price"))
+    net = total_rate - fuel_est["cost"]
+    
+    return f"""
+<b>📊 WEEKLY SUMMARY</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+<b>Week {wk}</b>
+
+<b>Loads</b>
+  Completed:      {len(week_records)}
+  Best:           #{best.get('load_number', '?')} (${best_rpm:.2f}/mi)
+
+<b>Revenue</b>
+  Gross:          {money(total_rate)}
+  Est. Fuel:      -{money(fuel_est['cost'])}
+  <b>Net:            {money(net)}</b>
+
+<b>Miles</b>
+  Loaded:         {total_miles}
+  Deadhead:       {total_deadhead}
+  Total:          {total_all_miles}
+
+<b>Averages</b>
+  $/mi (loaded):  ${avg_rpm:.2f}
+  $/mi (total):   ${total_rate / total_all_miles if total_all_miles else 0:.2f}
+
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+<i>Keep up the great work! 🚛</i>
+"""
+
+def build_detention_alert(stop_name: str, det: dict) -> str:
+    """Build detention time alert."""
+    return f"""
+<b>🚨 DETENTION ALERT</b>
+<code>━━━━━━━━━━━━━━━━━━━━━━</code>
+
+You've been at <b>{stop_name}</b> for <b>{det['formatted']}</b>.
+
+Consider documenting for detention pay:
+• Take timestamp photo
+• Note delay reason
+• Save contact name
+"""
 
 # ============================================================================
 # COMMAND HANDLERS
@@ -1906,6 +2209,141 @@ async def cmd_clearcache(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(f"✅ Cleared {old} cached addresses")
 
+async def cmd_deadhead(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Set deadhead miles for current load."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    job = get_job(st)
+    if not job:
+        await update.message.reply_text("📭 No active load")
+        return
+    
+    if not ctx.args:
+        current = job.get("meta", {}).get("deadhead", 0) or 0
+        await update.message.reply_text(
+            f"Current deadhead: {current} mi\n\nUsage: /deadhead <miles>"
+        )
+        return
+    
+    try:
+        miles = float(ctx.args[0])
+    except:
+        await update.message.reply_text("⚠️ Enter a number: /deadhead 150")
+        return
+    
+    async with _state_lock:
+        st = load_state()
+        job = get_job(st)
+        if job:
+            job.setdefault("meta", {})["deadhead"] = miles
+            st["job"] = job
+            save_state(st)
+    
+    await update.message.reply_text(f"✅ Deadhead set to {miles} mi")
+
+async def cmd_fuel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Set fuel price for calculations."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    if not ctx.args:
+        current = st.get("fuel_price") or FUEL_PRICE_DEFAULT
+        await update.message.reply_text(
+            f"Current fuel price: ${current:.2f}/gal\n\nUsage: /fuel <price>"
+        )
+        return
+    
+    try:
+        price = float(ctx.args[0].replace("$", ""))
+    except:
+        await update.message.reply_text("⚠️ Enter a number: /fuel 3.50")
+        return
+    
+    async with _state_lock:
+        st = load_state()
+        st["fuel_price"] = price
+        save_state(st)
+    
+    await update.message.reply_text(f"✅ Fuel price set to ${price:.2f}/gal")
+
+async def cmd_costs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show cost breakdown for current load."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    job = get_job(st)
+    if not job:
+        await update.message.reply_text("📭 No active load")
+        return
+    
+    await update.message.reply_text(
+        build_costs_message(job, st),
+        parse_mode="HTML",
+        reply_markup=build_costs_keyboard()
+    )
+
+async def cmd_photos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """View/manage photos for current load."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    job = get_job(st)
+    if not job:
+        await update.message.reply_text("📭 No active load")
+        return
+    
+    await update.message.reply_text(
+        build_photos_message(job),
+        parse_mode="HTML",
+        reply_markup=build_photos_keyboard(job)
+    )
+
+async def cmd_weekly(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show weekly summary."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    await update.message.reply_text(
+        build_weekly_summary(st),
+        parse_mode="HTML"
+    )
+
+async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show quick reply options."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    await update.message.reply_text(
+        build_quick_reply_message(),
+        parse_mode="HTML",
+        reply_markup=build_quick_reply_keyboard()
+    )
+
 # ============================================================================
 # LOCATION HANDLER
 # ============================================================================
@@ -1948,6 +2386,53 @@ You're all set!
             parse_mode="HTML",
             reply_markup=ReplyKeyboardRemove()
         )
+
+# ============================================================================
+# PHOTO HANDLER
+# ============================================================================
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming photos - save to current load if label is pending."""
+    if not update.message or not update.message.photo:
+        return
+    
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        return
+    
+    job = get_job(st)
+    if not job:
+        await update.message.reply_text("📭 No active load to attach photo to")
+        return
+    
+    # Get pending label or use default
+    label = st.get("pending_photo_label", "photo")
+    
+    # Get the largest photo
+    photo = update.message.photo[-1]
+    file_id = photo.file_id
+    
+    # Save to job
+    async with _state_lock:
+        st = load_state()
+        job = get_job(st)
+        if job:
+            photos = job.setdefault("photos", [])
+            photos.append({
+                "file_id": file_id,
+                "label": label,
+                "time": now_iso(),
+            })
+            st["job"] = job
+            st["pending_photo_label"] = None  # Clear pending
+            save_state(st)
+    
+    await update.message.reply_text(
+        f"✅ <b>{label.upper()}</b> photo saved!\n\n"
+        f"📸 {len(job.get('photos', []))} photos for {load_label(job)}",
+        parse_mode="HTML"
+    )
 
 # ============================================================================
 # TEXT HANDLER
@@ -2026,6 +2511,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await handle_finish_callback(update, ctx, st)
         elif data.startswith("NAV:"):
             await handle_nav_callback(update, ctx, st, data)
+        elif data == "COSTS":
+            await handle_costs_callback(update, ctx, st)
+        elif data.startswith("COST:"):
+            await handle_cost_action_callback(update, ctx, st, data)
+        elif data == "PHOTOS":
+            await handle_photos_callback(update, ctx, st)
+        elif data.startswith("PHOTO:"):
+            await handle_photo_action_callback(update, ctx, st, data)
+        elif data == "QUICKREPLY":
+            await handle_quick_reply_callback(update, ctx, st)
+        elif data.startswith("QR:"):
+            await handle_quick_reply_action_callback(update, ctx, st, data)
+        elif data == "PANEL":
+            await handle_back_to_panel_callback(update, ctx, st)
         else:
             await handle_status_callback(update, ctx, st, data)
     except Exception as e:
@@ -2085,6 +2584,137 @@ async def handle_nav_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st
                 reply_markup=build_panel_keyboard(job, st)
             )
         except: pass
+
+async def handle_costs_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict):
+    """Show cost breakdown."""
+    job = get_job(st)
+    if not job:
+        return
+    
+    try:
+        await update.callback_query.edit_message_text(
+            build_costs_message(job, st),
+            parse_mode="HTML",
+            reply_markup=build_costs_keyboard()
+        )
+    except: pass
+
+async def handle_cost_action_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, data: str):
+    """Handle cost-related actions."""
+    action = data.split(":")[1] if ":" in data else ""
+    job = get_job(st)
+    
+    if action == "breakdown":
+        if job:
+            await update.callback_query.edit_message_text(
+                build_costs_message(job, st),
+                parse_mode="HTML",
+                reply_markup=build_costs_keyboard()
+            )
+    elif action == "fuel":
+        await update.callback_query.answer(
+            "Send /fuel <price> to set fuel price\nExample: /fuel 3.50",
+            show_alert=True
+        )
+    elif action == "deadhead":
+        await update.callback_query.answer(
+            "Send /deadhead <miles> to set deadhead\nExample: /deadhead 150",
+            show_alert=True
+        )
+
+async def handle_photos_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict):
+    """Show photos menu."""
+    job = get_job(st)
+    if not job:
+        return
+    
+    try:
+        await update.callback_query.edit_message_text(
+            build_photos_message(job),
+            parse_mode="HTML",
+            reply_markup=build_photos_keyboard(job)
+        )
+    except: pass
+
+async def handle_photo_action_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, data: str):
+    """Handle photo-related actions."""
+    action = data.split(":")[1] if ":" in data else ""
+    job = get_job(st)
+    
+    if action == "view":
+        # Send all photos
+        photos = job.get("photos", []) if job else []
+        if not photos:
+            await update.callback_query.answer("No photos saved", show_alert=True)
+            return
+        
+        for p in photos:
+            try:
+                await ctx.bot.send_photo(
+                    update.effective_chat.id,
+                    p["file_id"],
+                    caption=f"📸 {p.get('label', 'Photo').upper()} - {load_label(job)}"
+                )
+            except:
+                pass
+    else:
+        # Set pending photo label
+        async with _state_lock:
+            st = load_state()
+            st["pending_photo_label"] = action
+            save_state(st)
+        
+        await update.callback_query.answer(
+            f"📸 Send a photo now to save as {action.upper()}",
+            show_alert=True
+        )
+
+async def handle_quick_reply_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict):
+    """Show quick reply options."""
+    try:
+        await update.callback_query.edit_message_text(
+            build_quick_reply_message(),
+            parse_mode="HTML",
+            reply_markup=build_quick_reply_keyboard()
+        )
+    except: pass
+
+async def handle_quick_reply_action_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, data: str):
+    """Handle quick reply selection."""
+    action = data.split(":")[1] if ":" in data else ""
+    
+    template = QUICK_REPLIES.get(action, "")
+    if not template:
+        return
+    
+    # For "running late", ask for minutes
+    if action == "running_late":
+        template = template.format(mins="[X]")
+        await update.callback_query.answer(
+            "Edit the [X] with actual minutes",
+            show_alert=True
+        )
+    
+    # Send as a new message they can copy
+    await ctx.bot.send_message(
+        update.effective_chat.id,
+        f"<b>📋 Copy this message:</b>\n\n<code>{template}</code>",
+        parse_mode="HTML"
+    )
+
+async def handle_back_to_panel_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict):
+    """Return to main panel."""
+    job = get_job(st)
+    if not job:
+        return
+    
+    try:
+        await update.callback_query.edit_message_text(
+            build_panel_message(job, st),
+            parse_mode="HTML",
+            reply_markup=build_panel_keyboard(job, st)
+        )
+    except: pass
 
 async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, data: str):
     async with _state_lock:
@@ -2321,6 +2951,7 @@ async def do_finish_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dic
         "deliveries": " | ".join(d.get("addr", "") for d in dels),
         "rate": meta.get("rate"),
         "posted_miles": meta.get("miles"),
+        "deadhead": meta.get("deadhead", 0),
     }
     
     async with _state_lock:
@@ -2411,8 +3042,51 @@ async def reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
                             await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
                         except: pass
                 save_state(st)
+        
+        # Check for detention alerts
+        await check_detention_alerts(ctx, st, job, chats)
+        
     except Exception as e:
         log_error("Reminder job", e)
+
+async def check_detention_alerts(ctx: ContextTypes.DEFAULT_TYPE, st: dict, job: dict, chats: List[int]):
+    """Check if driver has been at a stop too long."""
+    sent = st.get("reminders_sent", {})
+    alerts = []
+    
+    # Check pickup
+    pu = job.get("pu", {})
+    ps = pu.get("status", {})
+    if ps.get("arr") and not ps.get("dep"):
+        det = calc_detention(ps["arr"])
+        if det and det["alert"]:
+            key = f"detention:pu:{det['minutes'] // 30}"  # Alert every 30 min
+            if key not in sent:
+                alerts.append((key, "Pickup", det))
+    
+    # Check deliveries
+    for i, d in enumerate(job.get("del", [])):
+        ds = d.get("status", {})
+        if ds.get("arr") and not ds.get("dep"):
+            det = calc_detention(ds["arr"])
+            if det and det["alert"]:
+                lbl = f"Stop {i+1}" if len(job.get("del", [])) > 1 else "Delivery"
+                key = f"detention:del{i}:{det['minutes'] // 30}"
+                if key not in sent:
+                    alerts.append((key, lbl, det))
+    
+    if alerts:
+        async with _state_lock:
+            st = load_state()
+            sent = st.setdefault("reminders_sent", {})
+            for key, stop_name, det in alerts:
+                sent[key] = True
+                msg = build_detention_alert(stop_name, det)
+                for chat_id in chats:
+                    try:
+                        await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
+                    except: pass
+            save_state(st)
 
 def parse_appt_time(time_str: str, tz_name: str) -> Optional[datetime]:
     if not time_str:
@@ -2521,6 +3195,46 @@ async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================================
 # MAIN
 # ============================================================================
+async def weekly_summary_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Send weekly summary on configured day/time."""
+    try:
+        async with _state_lock:
+            st = load_state()
+        
+        tz_name = (st.get("last_location") or {}).get("tz", "UTC")
+        tz = safe_tz(tz_name)
+        now = now_utc().astimezone(tz)
+        
+        # Check if it's the right day and hour
+        if now.weekday() != WEEKLY_SUMMARY_DAY:
+            return
+        if now.hour != WEEKLY_SUMMARY_HOUR:
+            return
+        
+        # Check if already sent this week
+        wk = week_key(now)
+        if st.get("last_weekly_summary") == wk:
+            return
+        
+        # Send summary
+        chats = get_broadcast_chats(st)
+        summary = build_weekly_summary(st)
+        
+        for chat_id in chats:
+            try:
+                await ctx.bot.send_message(chat_id, summary, parse_mode="HTML")
+            except: pass
+        
+        # Mark as sent
+        async with _state_lock:
+            st = load_state()
+            st["last_weekly_summary"] = wk
+            save_state(st)
+        
+        log(f"Weekly summary sent for {wk}")
+    except Exception as e:
+        log_error("Weekly summary job", e)
+
 async def post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -2532,6 +3246,7 @@ async def post_init(app: Application):
     if app.job_queue:
         app.job_queue.run_repeating(reminder_job, interval=60, first=10)
         app.job_queue.run_repeating(geofence_job, interval=30, first=15)
+        app.job_queue.run_repeating(weekly_summary_job, interval=3600, first=60)  # Check hourly
     
     log(f"Ready! v{BOT_VERSION}")
 
@@ -2544,24 +3259,43 @@ def main():
     
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     
+    # Basic commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("testgeo", cmd_testgeo))
+    
+    # Setup commands
     app.add_handler(CommandHandler("claim", cmd_claim))
     app.add_handler(CommandHandler("allowhere", cmd_allowhere))
     app.add_handler(CommandHandler("update", cmd_update))
+    
+    # Load management
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("finish", cmd_finish))
-    app.add_handler(CommandHandler("catalog", cmd_catalog))
     app.add_handler(CommandHandler("skip", cmd_skip))
+    
+    # Info commands
+    app.add_handler(CommandHandler("catalog", cmd_catalog))
+    app.add_handler(CommandHandler("weekly", cmd_weekly))
+    app.add_handler(CommandHandler("costs", cmd_costs))
+    app.add_handler(CommandHandler("photos", cmd_photos))
+    
+    # Settings commands
+    app.add_handler(CommandHandler("deadhead", cmd_deadhead))
+    app.add_handler(CommandHandler("fuel", cmd_fuel))
+    app.add_handler(CommandHandler("reply", cmd_reply))
+    
+    # Utility commands
+    app.add_handler(CommandHandler("testgeo", cmd_testgeo))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     app.add_handler(CommandHandler("deleteall", cmd_deleteall))
     app.add_handler(CommandHandler("leave", cmd_leave))
-    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     
+    # Message handlers
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     
     app.run_polling(drop_pending_updates=True)
