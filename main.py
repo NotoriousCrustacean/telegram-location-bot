@@ -1931,6 +1931,9 @@ async def handle_reset_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
             )
         except TelegramError:
             pass
+
+
+async def leave_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Leave a group chat."""
     async with _state_lock:
         st = load_state()
