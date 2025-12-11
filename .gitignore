@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# Bot state files
+state.json
+state.json.tmp
+dispatch_bot_state.json
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+
+# Temporary
+*.tmp
+*.bak
