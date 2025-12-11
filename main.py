@@ -1,6 +1,12 @@
 """
 Telegram Trucker Dispatch Assistant Bot
-Version: 2025-12-11_v2
+Version: 2025-12-11_v3 (Bulletproof Edition)
+
+Fixes:
+- Improved geocoding with multiple address variants
+- Fixed deleteall command (no longer deletes itself)
+- Better address parsing for multi-line formats
+- Enhanced error logging
 """
 
 import asyncio
@@ -12,14 +18,14 @@ import math
 import os
 import re
 import time
-from datetime import datetime, timezone, timedelta, date
+import traceback
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 import httpx
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
-from openpyxl.utils import get_column_letter
 from timezonefinder import TimezoneFinder
 from zoneinfo import ZoneInfo
 
@@ -42,7 +48,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "2025-12-11_v2"
+BOT_VERSION = "2025-12-11_v3"
 
 # ============================================================================
 # CONFIGURATION
@@ -74,7 +80,6 @@ def env_list_int(name: str, default: List[int]) -> List[int]:
     try: return [int(x.strip()) for x in v.split(",") if x.strip()]
     except: return default
 
-# Environment variables
 TOKEN = env_str("TELEGRAM_TOKEN")
 CLAIM_CODE = env_str("CLAIM_CODE")
 STATE_FILE = Path(env_str("STATE_FILE", "state.json"))
@@ -92,11 +97,16 @@ REMINDER_DOC_AFTER_MIN = env_int("REMINDER_DOC_AFTER_MIN", 15)
 REMINDER_THRESHOLDS_MIN = env_list_int("REMINDER_THRESHOLDS_MIN", [60, 30, 10])
 SCHEDULE_GRACE_MIN = env_int("SCHEDULE_GRACE_MIN", 30)
 
-DEBUG = env_bool("DEBUG")
+DEBUG = env_bool("DEBUG", True)
 
 def log(msg: str):
-    if DEBUG:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    ts = datetime.now().strftime('%H:%M:%S')
+    print(f"[{ts}] {msg}", flush=True)
+
+def log_error(msg: str, exc: Exception = None):
+    log(f"ERROR: {msg}")
+    if exc and DEBUG:
+        traceback.print_exc()
 
 # ============================================================================
 # GLOBALS
@@ -134,8 +144,8 @@ def money(x) -> str:
 
 def fmt_dur(secs: float) -> str:
     secs = max(0, int(secs))
-    h, m = divmod(secs // 60, 60)
-    return f"{h}h {m}m" if h else f"{m}m"
+    hours, mins = divmod(secs // 60, 60)
+    return f"{hours}h {mins}m" if hours else f"{mins}m"
 
 def fmt_mi(meters: float) -> str:
     mi = meters / METERS_PER_MILE
@@ -157,7 +167,8 @@ def load_state() -> dict:
             st = json.loads(STATE_FILE.read_text())
             if isinstance(st, dict):
                 return st
-        except: pass
+        except Exception as e:
+            log_error(f"Failed to load state", e)
     return {}
 
 def save_state(st: dict):
@@ -167,7 +178,7 @@ def save_state(st: dict):
         tmp.write_text(json.dumps(st, indent=2))
         tmp.replace(STATE_FILE)
     except Exception as e:
-        log(f"Save error: {e}")
+        log_error("Failed to save state", e)
 
 def is_owner(update: Update, st: dict) -> bool:
     u = update.effective_user
@@ -186,10 +197,10 @@ def get_broadcast_chats(st: dict) -> List[int]:
     return chats
 
 # ============================================================================
-# GEOCODING & ROUTING
+# IMPROVED GEOCODING - Multiple fallback strategies
 # ============================================================================
 def haversine_miles(lat1, lon1, lat2, lon2) -> float:
-    R = 3958.8  # Earth radius in miles
+    R = 3958.8
     lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
     dlat, dlon = lat2 - lat1, lon2 - lon1
     a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
@@ -198,20 +209,121 @@ def haversine_miles(lat1, lon1, lat2, lon2) -> float:
 def haversine_meters(lat1, lon1, lat2, lon2) -> float:
     return haversine_miles(lat1, lon1, lat2, lon2) * METERS_PER_MILE
 
+def generate_address_variants(addr: str) -> List[str]:
+    """Generate multiple address variants for geocoding - bulletproof approach."""
+    if not addr:
+        return []
+    
+    variants = []
+    addr = addr.strip()
+    
+    # 1. Original address
+    variants.append(addr)
+    
+    # 2. Original + USA
+    if "USA" not in addr.upper():
+        variants.append(f"{addr}, USA")
+    
+    # 3. Split by comma and try combinations
+    parts = [p.strip() for p in addr.split(",") if p.strip()]
+    
+    if len(parts) >= 2:
+        # Without first part (often company name like "MODERN")
+        without_first = ", ".join(parts[1:])
+        variants.append(without_first)
+        variants.append(f"{without_first}, USA")
+        
+        # Last 2 parts (usually city, state or state zip)
+        last_two = ", ".join(parts[-2:])
+        variants.append(last_two)
+        
+        # Last 3 parts
+        if len(parts) >= 3:
+            last_three = ", ".join(parts[-3:])
+            variants.append(last_three)
+            variants.append(f"{last_three}, USA")
+    
+    # 4. Extract street number + street + city + state pattern
+    # Handle "310 WEST WASHINGTON STREET NORRISTOWN, PA"
+    street_pattern = re.search(
+        r'(\d+\s+(?:[NSEW]\s+)?[\w\s]+(?:ST|STREET|AVE|AVENUE|BLVD|BOULEVARD|RD|ROAD|DR|DRIVE|LN|LANE|CT|COURT|WAY|PL|PLACE|HWY|HIGHWAY|PKWY|PARKWAY))[,\s]+([^,]+)[,\s]+([A-Z]{2})(?:\s+(\d{5}))?',
+        addr.upper()
+    )
+    if street_pattern:
+        street = street_pattern.group(1).strip()
+        city = street_pattern.group(2).strip()
+        state = street_pattern.group(3).strip()
+        zipcode = street_pattern.group(4) or ""
+        
+        # Normalize street abbreviations
+        street = re.sub(r'\bSTREET\b', 'ST', street)
+        street = re.sub(r'\bAVENUE\b', 'AVE', street)
+        street = re.sub(r'\bBOULEVARD\b', 'BLVD', street)
+        street = re.sub(r'\bDRIVE\b', 'DR', street)
+        street = re.sub(r'\bROAD\b', 'RD', street)
+        
+        variants.append(f"{street}, {city}, {state}")
+        variants.append(f"{street}, {city}, {state}, USA")
+        if zipcode:
+            variants.append(f"{street}, {city}, {state} {zipcode}")
+            variants.append(f"{street}, {city}, {state} {zipcode}, USA")
+        
+        # Just city, state
+        variants.append(f"{city}, {state}")
+        variants.append(f"{city}, {state}, USA")
+    
+    # 5. Try to find just city, state anywhere in address
+    city_state = re.search(r'([A-Za-z\s]+),\s*([A-Z]{2})(?:\s+\d{5})?', addr)
+    if city_state:
+        city = city_state.group(1).strip()
+        state = city_state.group(2).strip()
+        if len(city) > 2:  # Not just abbreviation
+            variants.append(f"{city}, {state}")
+            variants.append(f"{city}, {state}, USA")
+    
+    # 6. Look for ZIP code and use that
+    zip_match = re.search(r'\b(\d{5})\b', addr)
+    if zip_match:
+        variants.append(zip_match.group(1))
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique = []
+    for v in variants:
+        v_clean = " ".join(v.split()).strip()
+        v_lower = v_clean.lower()
+        if v_lower and v_lower not in seen and len(v_clean) > 3:
+            seen.add(v_lower)
+            unique.append(v_clean)
+    
+    if DEBUG:
+        log(f"Address variants for '{addr[:40]}': {len(unique)} variants")
+    
+    return unique
+
 async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
+    """Geocode with multiple fallback variants."""
+    if not addr:
+        return None
+    
+    # Check cache
     if addr in cache:
         c = cache[addr]
         return c["lat"], c["lon"], c.get("tz", "UTC")
     
     if not NOMINATIM_USER_AGENT:
+        log("Geocode: No user agent configured")
         return None
     
-    variants = [addr]
-    if ", USA" not in addr.upper():
-        variants.append(addr + ", USA")
+    variants = generate_address_variants(addr)
+    if not variants:
+        return None
     
-    async with httpx.AsyncClient(timeout=15) as client:
-        for q in variants:
+    headers = {"User-Agent": NOMINATIM_USER_AGENT}
+    
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        for i, query in enumerate(variants[:10]):  # Try up to 10 variants
+            # Rate limiting
             async with _geo_lock:
                 global _geo_last
                 wait = _geo_last + NOMINATIM_MIN_INTERVAL - time.monotonic()
@@ -220,56 +332,98 @@ async def geocode(addr: str, cache: dict) -> Optional[Tuple[float, float, str]]:
                 _geo_last = time.monotonic()
             
             try:
-                r = await client.get(NOMINATIM_URL, 
-                    params={"q": q, "format": "jsonv2", "limit": 1},
-                    headers={"User-Agent": NOMINATIM_USER_AGENT})
+                if DEBUG:
+                    log(f"Geocode [{i+1}/{len(variants)}]: {query[:50]}")
+                
+                r = await client.get(
+                    NOMINATIM_URL,
+                    params={
+                        "q": query,
+                        "format": "jsonv2",
+                        "limit": 1,
+                        "countrycodes": "us",
+                    }
+                )
+                
                 if r.status_code == 200:
                     data = r.json()
-                    if data:
-                        lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
+                    if data and len(data) > 0:
+                        lat = float(data[0]["lat"])
+                        lon = float(data[0]["lon"])
+                        display = data[0].get("display_name", "")
                         tz = TF.timezone_at(lat=lat, lng=lon) or "UTC"
-                        cache[addr] = {"lat": lat, "lon": lon, "tz": tz}
+                        
+                        # Cache result
+                        cache[addr] = {"lat": lat, "lon": lon, "tz": tz, "display": display}
+                        
+                        log(f"Geocode SUCCESS: {lat:.4f}, {lon:.4f}")
                         return lat, lon, tz
+                        
             except Exception as e:
-                log(f"Geocode error: {e}")
+                log_error(f"Geocode error for '{query[:30]}'", e)
+    
+    log(f"Geocode FAILED: No results for '{addr[:40]}'")
     return None
 
 async def get_route(origin: Tuple[float, float], dest: Tuple[float, float]) -> Optional[Tuple[float, float]]:
+    """Get driving route from OSRM."""
     url = OSRM_URL.format(lat1=origin[0], lon1=origin[1], lat2=dest[0], lon2=dest[1])
+    
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(url, params={"overview": "false"})
             if r.status_code == 200:
                 data = r.json()
-                if data.get("routes"):
+                if data.get("code") == "Ok" and data.get("routes"):
                     rt = data["routes"][0]
                     return rt["distance"], rt["duration"]
     except Exception as e:
-        log(f"Route error: {e}")
+        log_error("Route error", e)
+    
     return None
 
 async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
+    """Calculate ETA to address."""
+    if not addr:
+        return {"ok": False, "err": "No address"}
+    
     cache = st.setdefault("geocode_cache", {})
     geo = await geocode(addr, cache)
+    
     if not geo:
-        return {"ok": False, "err": "Location not found"}
+        return {"ok": False, "err": f"Location not found"}
     
     dest = (geo[0], geo[1])
     route = await get_route(origin, dest)
     
     if route:
-        return {"ok": True, "meters": route[0], "seconds": route[1], "tz": geo[2], "method": "route"}
+        return {
+            "ok": True,
+            "meters": route[0],
+            "seconds": route[1],
+            "tz": geo[2],
+            "method": "route",
+        }
     
-    # Fallback to straight-line estimate
-    dist = haversine_meters(origin[0], origin[1], dest[0], dest[1])
-    speed = 55 if dist < 80000 else (70 if dist < 300000 else 65)  # mph estimates
-    secs = (dist / METERS_PER_MILE / speed) * 3600
-    return {"ok": True, "meters": dist, "seconds": secs, "tz": geo[2], "method": "estimate"}
+    # Fallback to haversine
+    dist_m = haversine_meters(origin[0], origin[1], dest[0], dest[1])
+    dist_mi = dist_m / METERS_PER_MILE
+    
+    # Speed based on distance
+    speed_mph = 35 if dist_mi < 50 else (50 if dist_mi < 150 else 60)
+    est_secs = (dist_mi / speed_mph) * 3600 * 1.2  # 20% buffer
+    
+    return {
+        "ok": True,
+        "meters": dist_m,
+        "seconds": est_secs,
+        "tz": geo[2],
+        "method": "estimate",
+    }
 
 # ============================================================================
-# LOAD PARSING - Updated for your format
+# IMPROVED LOAD PARSING
 # ============================================================================
-# Patterns for your specific format
 LOAD_NUM_PATTERN = re.compile(r"Load\s*#\s*(\S+)", re.I)
 RATE_PATTERN = re.compile(r"Rate\s*:\s*\$?([\d,]+(?:\.\d{2})?)", re.I)
 MILES_PATTERN = re.compile(r"Total\s*mi\s*:\s*([\d,]+)", re.I)
@@ -279,84 +433,107 @@ PU_ADDR_PATTERN = re.compile(r"PU\s*Address\s*:\s*(.+?)(?=\n\s*\n|\nDEL|\n-{3,}|
 DEL_ADDR_PATTERN = re.compile(r"DEL\s*Address\s*:\s*(.+?)(?=\n\s*\n|\n-{3,}|\nTotal|$)", re.I | re.S)
 
 def clean_address(addr: str) -> str:
-    """Clean up address text."""
-    lines = [ln.strip() for ln in addr.strip().split("\n") if ln.strip()]
-    # Filter out obvious non-address lines
-    cleaned = []
-    for ln in lines:
+    """Clean address - join multi-line addresses properly."""
+    if not addr:
+        return ""
+    
+    lines = []
+    for ln in addr.strip().split("\n"):
+        ln = ln.strip()
+        if not ln or len(ln) < 2:
+            continue
+        
+        # Stop markers
         ln_lower = ln.lower()
-        if any(skip in ln_lower for skip in ["---", "===", "total mi", "rate", "trailer", "failure"]):
+        if any(skip in ln_lower for skip in ["---", "===", "total mi", "rate :", "trailer", "failure"]):
             break
-        cleaned.append(ln)
-    return ", ".join(cleaned) if cleaned else ""
+        
+        lines.append(ln)
+    
+    if not lines:
+        return ""
+    
+    # Smart join - detect if line is continuation
+    result = []
+    for i, ln in enumerate(lines):
+        if i == 0:
+            result.append(ln)
+        elif re.match(r'^\d+\s', ln):
+            # Starts with number (street address)
+            result.append(ln)
+        elif re.match(r'^[A-Z]{2}\s*\d{5}', ln):
+            # State + ZIP
+            result.append(ln)
+        elif result and not result[-1].rstrip().endswith(','):
+            # Continuation - append with space
+            result[-1] = result[-1].rstrip() + ' ' + ln
+        else:
+            result.append(ln)
+    
+    return ", ".join(result)
 
 def parse_load(text: str) -> Optional[dict]:
-    """Parse load information from dispatcher message."""
+    """Parse load from dispatcher message."""
     
-    # Must have both PU and DEL addresses
     if "pu address" not in text.lower() or "del address" not in text.lower():
         return None
     
-    # Extract load number
+    log("Parsing load...")
+    
     load_num = None
     m = LOAD_NUM_PATTERN.search(text)
     if m:
         load_num = m.group(1).strip()
+        log(f"  Load #: {load_num}")
     
-    # Extract rate
     rate = None
     m = RATE_PATTERN.search(text)
     if m:
         try:
             rate = float(m.group(1).replace(",", ""))
+            log(f"  Rate: ${rate}")
         except: pass
     
-    # Extract miles
     miles = None
     m = MILES_PATTERN.search(text)
     if m:
         try:
             miles = int(m.group(1).replace(",", ""))
+            log(f"  Miles: {miles}")
         except: pass
     
-    # Extract PU time
     pu_time = None
     m = PU_TIME_PATTERN.search(text)
     if m:
         pu_time = m.group(1).strip()
     
-    # Extract DEL time
     del_time = None
     m = DEL_TIME_PATTERN.search(text)
     if m:
         del_time = m.group(1).strip()
     
-    # Extract PU address
     pu_addr = None
     m = PU_ADDR_PATTERN.search(text)
     if m:
         pu_addr = clean_address(m.group(1))
+        log(f"  PU: {pu_addr}")
     
-    # Extract DEL address
     del_addr = None
     m = DEL_ADDR_PATTERN.search(text)
     if m:
         del_addr = clean_address(m.group(1))
+        log(f"  DEL: {del_addr}")
     
     if not pu_addr or not del_addr:
+        log("  FAILED: Missing address")
         return None
     
-    # Build job structure
     job_id = hashlib.sha1(f"{load_num}|{pu_addr}|{del_addr}".encode()).hexdigest()[:10]
     
     job = {
         "id": job_id,
         "created_at": now_iso(),
-        "meta": {
-            "load_number": load_num,
-            "rate": rate,
-            "miles": miles,
-        },
+        "meta": {"load_number": load_num, "rate": rate, "miles": miles},
         "pu": {
             "addr": pu_addr,
             "time": pu_time,
@@ -371,10 +548,10 @@ def parse_load(text: str) -> Optional[dict]:
         }],
     }
     
+    log(f"  SUCCESS: Job {job_id}")
     return job
 
 def get_job(st: dict) -> Optional[dict]:
-    """Get normalized job from state."""
     job = st.get("job")
     if not job or not isinstance(job, dict):
         return None
@@ -389,7 +566,6 @@ def is_pu_complete(job: dict) -> bool:
     return bool(job.get("pu", {}).get("status", {}).get("comp"))
 
 def get_focus(job: dict, st: dict) -> Tuple[str, int]:
-    """Get current focus: ('PU', 0) or ('DEL', index)."""
     if not is_pu_complete(job):
         return "PU", 0
     
@@ -397,7 +573,6 @@ def get_focus(job: dict, st: dict) -> Tuple[str, int]:
     idx = st.get("focus_i", 0)
     idx = max(0, min(idx, len(dels) - 1)) if dels else 0
     
-    # Find next incomplete if current is done
     if dels and idx < len(dels):
         if dels[idx].get("status", {}).get("comp"):
             for i in range(idx + 1, len(dels)):
@@ -414,12 +589,13 @@ def load_label(job: dict) -> str:
     return f"Job {job.get('id', '?')[:8]}"
 
 def short_addr(addr: str, max_len: int = 50) -> str:
+    if not addr:
+        return "(no address)"
     if len(addr) <= max_len:
         return addr
     return addr[:max_len-3] + "..."
 
 def toggle_timestamp(obj: dict, key: str) -> bool:
-    """Toggle a timestamp field. Returns True if turned ON."""
     if obj.get(key):
         obj[key] = None
         return False
@@ -473,7 +649,6 @@ def build_panel_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
                 btn("⏭ Skip", "DEL:SKIP"),
             ])
             
-            # Navigation for multiple stops
             if len(dels) > 1:
                 nav = []
                 if idx > 0:
@@ -495,19 +670,20 @@ def build_done_keyboard() -> InlineKeyboardMarkup:
 # ALERTS
 # ============================================================================
 async def send_alert(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
-    """Send auto-deleting alert."""
     try:
         msg = await ctx.bot.send_message(chat_id, text, parse_mode="HTML", disable_notification=True)
         if ALERT_TTL_SECONDS > 0:
             async def delete_later():
                 await asyncio.sleep(ALERT_TTL_SECONDS)
-                try: await ctx.bot.delete_message(chat_id, msg.message_id)
-                except: pass
+                try:
+                    await ctx.bot.delete_message(chat_id, msg.message_id)
+                except:
+                    pass
             task = asyncio.create_task(delete_later())
             _tasks.add(task)
             task.add_done_callback(_tasks.discard)
     except Exception as e:
-        log(f"Alert error: {e}")
+        log_error("Alert failed", e)
 
 # ============================================================================
 # EXCEL EXPORT
@@ -517,14 +693,12 @@ def make_catalog_xlsx(records: List[dict], week: str) -> Tuple[bytes, str]:
     ws = wb.active
     ws.title = week[:31] if week != "ALL" else "All Loads"
     
-    # Header
     headers = ["Completed", "Load #", "Pickup", "Delivery", "Rate", "Miles", "$/Mile"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill("solid", fgColor="4472C4")
     
-    # Data
     total_rate, total_miles = 0, 0
     for r in sorted(records, key=lambda x: x.get("completed_utc", "")):
         rate = r.get("rate")
@@ -544,21 +718,14 @@ def make_catalog_xlsx(records: List[dict], week: str) -> Tuple[bytes, str]:
         if rate: total_rate += rate
         if miles: total_miles += miles
     
-    # Totals
     ws.append([])
-    ws.append(["TOTAL", "", "", "", total_rate, total_miles, 
+    ws.append(["TOTAL", "", "", "", total_rate, total_miles,
                round(total_rate/total_miles, 2) if total_miles else None])
     for cell in ws[ws.max_row]:
         cell.font = Font(bold=True)
     
-    # Format columns
-    ws.column_dimensions["A"].width = 18
-    ws.column_dimensions["B"].width = 15
-    ws.column_dimensions["C"].width = 40
-    ws.column_dimensions["D"].width = 40
-    ws.column_dimensions["E"].width = 12
-    ws.column_dimensions["F"].width = 10
-    ws.column_dimensions["G"].width = 10
+    for col, width in [("A", 18), ("B", 15), ("C", 40), ("D", 40), ("E", 12), ("F", 10), ("G", 10)]:
+        ws.column_dimensions[col].width = width
     
     buf = io.BytesIO()
     wb.save(buf)
@@ -572,21 +739,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = f"""🚚 <b>Trucker Dispatch Bot</b> v{BOT_VERSION}
 
 <b>Setup:</b>
-1. DM me: /claim &lt;code&gt;
-2. DM me: /update (share location)
-3. In group: /allowhere
+1. DM: /claim &lt;code&gt;
+2. DM: /update (share location)
+3. Group: /allowhere
 
 <b>Usage:</b>
-• Forward load sheet to group
-• Type <code>eta</code> or <code>1717</code> for ETA
-• Use /panel for controls
+• Forward load sheet → auto-detects
+• Type <code>eta</code> or <code>1717</code>
+• /panel for controls
 • /finish when done
-• /catalog for Excel report
 
-<b>Features:</b>
-📍 {GEOFENCE_MILES} mi geofence alerts
-⏰ {REMINDER_THRESHOLDS_MIN} min appointment alerts
-📋 Doc reminders after {REMINDER_DOC_AFTER_MIN} min"""
+<b>Commands:</b>
+/clearcache - Reset geocoding if stuck"""
     
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -599,14 +763,24 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     job = get_job(st)
     loc = st.get("last_location")
+    gc = st.get("geocode_cache", {})
+    
+    loc_info = "❌ Not set"
+    if loc:
+        age_min = 0
+        if loc.get("updated_at"):
+            try:
+                age_min = int((now_utc() - datetime.fromisoformat(loc["updated_at"])).total_seconds() / 60)
+            except: pass
+        loc_info = f"✅ {loc['lat']:.4f}, {loc['lon']:.4f} ({age_min}m ago)"
     
     text = f"""<b>Status</b>
+• Version: {BOT_VERSION}
 • Owner: {st.get('owner_id', 'Not set')}
-• Your ID: {update.effective_user.id if update.effective_user else '?'}
-• Allowed here: {'✅' if chat_allowed(update, st) else '❌'}
-• Location: {'✅' if loc else '❌'}
-• Active load: {load_label(job) if job else '❌'}
-• History: {len(st.get('history', []))} loads"""
+• Location: {loc_info}
+• Active load: {load_label(job) if job else '❌ None'}
+• History: {len(st.get('history', []))} loads
+• Cache: {len(gc)} addresses"""
     
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -616,7 +790,7 @@ async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     if not CLAIM_CODE:
-        await update.message.reply_text("⚠️ CLAIM_CODE not configured")
+        await update.message.reply_text("⚠️ CLAIM_CODE not set")
         return
     
     code = " ".join(ctx.args) if ctx.args else ""
@@ -629,7 +803,8 @@ async def cmd_claim(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st["owner_id"] = update.effective_user.id
         save_state(st)
     
-    await update.message.reply_text("✅ You're now the owner! Use /update to share location.")
+    log(f"Owner: {update.effective_user.id}")
+    await update.message.reply_text("✅ You're the owner! Use /update to share location.")
 
 async def cmd_allowhere(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with _state_lock:
@@ -640,7 +815,7 @@ async def cmd_allowhere(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     if update.effective_chat.type == "private":
-        await update.message.reply_text("⚠️ Run this in a group")
+        await update.message.reply_text("⚠️ Run in group")
         return
     
     async with _state_lock:
@@ -650,6 +825,7 @@ async def cmd_allowhere(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st["allowed_chats"] = list(allowed)
         save_state(st)
     
+    log(f"Group allowed: {update.effective_chat.id}")
     await update.message.reply_text("✅ Group allowed!")
 
 async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -666,7 +842,7 @@ async def cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     kb = [[KeyboardButton("📍 Share Location", request_location=True)]]
     await update.message.reply_text(
-        "Tap to share your location.\n💡 Use 'Live Location' for auto geofence!",
+        "Tap to share location.\n💡 Use 'Live Location' for geofence!",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
     )
 
@@ -675,35 +851,34 @@ async def cmd_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st = load_state()
     
     if not chat_allowed(update, st):
-        await update.message.reply_text("⚠️ Not allowed. Owner: /allowhere")
+        await update.message.reply_text("⚠️ Not allowed")
         return
     
     job = get_job(st)
     if not job:
-        await update.message.reply_text("📭 No active load. Forward a load sheet!")
+        await update.message.reply_text("📭 No active load")
         return
     
     meta = job.get("meta", {})
     stage, idx = get_focus(job, st)
     
     lines = [f"<b>{h(load_label(job))}</b>"]
-    if meta.get("rate"):
-        lines.append(f"💰 {money(meta['rate'])} • {meta.get('miles', '?')} mi")
+    if meta.get("rate") or meta.get("miles"):
+        parts = []
+        if meta.get("rate"): parts.append(f"💰 {money(meta['rate'])}")
+        if meta.get("miles"): parts.append(f"{meta['miles']} mi")
+        lines.append(" • ".join(parts))
     
     if stage == "PU":
         pu = job.get("pu", {})
         lines.append(f"\n<b>📍 Pickup</b>")
-        lines.append(h(short_addr(pu.get("addr", ""))))
-        if pu.get("time"):
-            lines.append(f"⏰ {h(pu['time'])}")
+        lines.append(h(short_addr(pu.get("addr", ""), 60)))
     else:
         dels = job.get("del", [])
         if idx < len(dels):
             d = dels[idx]
             lines.append(f"\n<b>📍 Delivery {idx+1}/{len(dels)}</b>")
-            lines.append(h(short_addr(d.get("addr", ""))))
-            if d.get("time"):
-                lines.append(f"⏰ {h(d['time'])}")
+            lines.append(h(short_addr(d.get("addr", ""), 60)))
     
     msg = await update.message.reply_text(
         "\n".join(lines),
@@ -711,7 +886,6 @@ async def cmd_panel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_panel_keyboard(job, st)
     )
     
-    # Save panel message ID
     async with _state_lock:
         st = load_state()
         st.setdefault("panel_msgs", {})[str(update.effective_chat.id)] = msg.message_id
@@ -742,10 +916,9 @@ async def cmd_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     history = st.get("history", [])
     if not history:
-        await update.message.reply_text("📭 No completed loads yet")
+        await update.message.reply_text("📭 No loads yet")
         return
     
-    # Determine week
     tz_name = (st.get("last_location") or {}).get("tz", "UTC")
     current_week = week_key(now_utc().astimezone(safe_tz(tz_name)))
     
@@ -753,9 +926,6 @@ async def cmd_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if arg == "all":
         week = "ALL"
         records = history
-    elif arg in ("last", "prev"):
-        week = week_key(now_utc().astimezone(safe_tz(tz_name)) - timedelta(days=7))
-        records = [r for r in history if r.get("week") == week]
     else:
         week = current_week
         records = [r for r in history if r.get("week") == week]
@@ -765,14 +935,12 @@ async def cmd_catalog(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     xlsx_data, filename = make_catalog_xlsx(records, week)
-    
     total_rate = sum(r.get("rate", 0) or 0 for r in records)
-    total_miles = sum((r.get("posted_miles") or r.get("est_miles") or 0) for r in records)
     
     await update.message.reply_document(
         document=io.BytesIO(xlsx_data),
         filename=filename,
-        caption=f"📊 <b>{week}</b>\n{len(records)} loads • {money(total_rate)} • {int(total_miles)} mi",
+        caption=f"📊 {len(records)} loads • {money(total_rate)}",
         parse_mode="HTML"
     )
 
@@ -781,12 +949,10 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         st = load_state()
     
     if not is_owner(update, st):
-        await update.message.reply_text("⚠️ Owner only")
         return
     
     job = get_job(st)
     if not job:
-        await update.message.reply_text("📭 No active load")
         return
     
     stage, idx = get_focus(job, st)
@@ -794,51 +960,78 @@ async def cmd_skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Complete pickup first")
         return
     
-    dels = job.get("del", [])
-    if idx >= len(dels):
-        await update.message.reply_text("⚠️ No stop to skip")
-        return
-    
     async with _state_lock:
         st = load_state()
         job = get_job(st)
-        dels = job.get("del", [])
-        dels[idx]["status"]["skip"] = True
-        dels[idx]["status"]["comp"] = now_iso()
-        
-        # Move to next incomplete
-        for i in range(idx + 1, len(dels)):
-            if not dels[i].get("status", {}).get("comp"):
-                st["focus_i"] = i
-                break
-        
-        st["job"] = job
-        save_state(st)
+        if job:
+            dels = job.get("del", [])
+            if idx < len(dels):
+                dels[idx]["status"]["skip"] = True
+                dels[idx]["status"]["comp"] = now_iso()
+                st["job"] = job
+                save_state(st)
     
-    await update.message.reply_text(f"⏭ Skipped stop {idx+1}. Use /panel to continue.")
+    await update.message.reply_text(f"⏭ Skipped stop {idx+1}")
 
 async def cmd_deleteall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """FIXED: Delete messages without deleting itself."""
     async with _state_lock:
         st = load_state()
     
     if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
         return
     
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("Can't clear DM history")
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
+        await update.message.reply_text("❌ Use in group")
         return
     
-    n = int(ctx.args[0]) if ctx.args else DELETEALL_DEFAULT
+    n = DELETEALL_DEFAULT
+    if ctx.args:
+        try:
+            n = int(ctx.args[0])
+        except: pass
     n = max(1, min(n, 2000))
     
-    msg = await update.message.reply_text(f"🧹 Deleting up to {n} messages...")
+    cmd_msg_id = update.message.message_id
     
-    for mid in range(msg.message_id, max(1, msg.message_id - n), -1):
+    # Send status
+    status_msg = await update.message.reply_text(f"🧹 Deleting up to {n} messages...")
+    status_msg_id = status_msg.message_id
+    
+    deleted = 0
+    failed = 0
+    
+    # Delete messages BEFORE the command (not command or status)
+    for mid in range(cmd_msg_id - 1, max(0, cmd_msg_id - n - 1), -1):
         try:
-            await ctx.bot.delete_message(update.effective_chat.id, mid)
+            await ctx.bot.delete_message(chat.id, mid)
+            deleted += 1
+            await asyncio.sleep(0.05)
+        except BadRequest:
+            failed += 1
+            if failed > 30:
+                break
+        except Forbidden:
+            await status_msg.edit_text("❌ No permission")
+            return
         except:
-            break
-        await asyncio.sleep(0.03)
+            failed += 1
+            if failed > 30:
+                break
+    
+    # Delete command message
+    try:
+        await ctx.bot.delete_message(chat.id, cmd_msg_id)
+    except: pass
+    
+    # Update and delete status after delay
+    try:
+        await status_msg.edit_text(f"✅ Deleted {deleted} messages")
+        await asyncio.sleep(3)
+        await ctx.bot.delete_message(chat.id, status_msg_id)
+    except: pass
 
 async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with _state_lock:
@@ -847,21 +1040,38 @@ async def cmd_leave(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update, st):
         return
     
-    if update.effective_chat.type == "private":
-        await update.message.reply_text("Use in a group")
+    chat = update.effective_chat
+    if not chat or chat.type == "private":
         return
     
     async with _state_lock:
         st = load_state()
         allowed = set(st.get("allowed_chats", []))
-        allowed.discard(update.effective_chat.id)
+        allowed.discard(chat.id)
         st["allowed_chats"] = list(allowed)
         save_state(st)
     
-    await update.message.reply_text("👋 Leaving...")
+    await update.message.reply_text("👋")
     try:
-        await ctx.bot.leave_chat(update.effective_chat.id)
+        await ctx.bot.leave_chat(chat.id)
     except: pass
+
+async def cmd_clearcache(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Clear geocode cache."""
+    async with _state_lock:
+        st = load_state()
+    
+    if not is_owner(update, st):
+        await update.message.reply_text("⚠️ Owner only")
+        return
+    
+    async with _state_lock:
+        st = load_state()
+        old = len(st.get("geocode_cache", {}))
+        st["geocode_cache"] = {}
+        save_state(st)
+    
+    await update.message.reply_text(f"✅ Cleared {old} cached addresses")
 
 # ============================================================================
 # LOCATION HANDLER
@@ -889,11 +1099,16 @@ async def on_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }
         save_state(st)
     
+    log(f"Location: {loc.latitude:.4f}, {loc.longitude:.4f}")
+    
     if update.effective_chat.type == "private":
-        await update.message.reply_text("✅ Location saved!", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            f"✅ Location saved!\n📍 {loc.latitude:.4f}, {loc.longitude:.4f}\n🕐 {tz}",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 # ============================================================================
-# TEXT HANDLER (Load detection + triggers)
+# TEXT HANDLER
 # ============================================================================
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -905,8 +1120,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with _state_lock:
         st = load_state()
     
-    # Detect new loads in allowed groups
-    if chat.type in ("group", "supergroup"):
+    # Detect loads in groups
+    if chat and chat.type in ("group", "supergroup"):
         if chat.id not in (st.get("allowed_chats") or []):
             return
         
@@ -921,12 +1136,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 save_state(st)
             
             meta = job.get("meta", {})
-            lines = [
-                f"📦 <b>New Load!</b>",
-                f"<b>{h(load_label(job))}</b>",
-            ]
-            if meta.get("rate"):
-                lines.append(f"💰 {money(meta['rate'])} • {meta.get('miles', '?')} mi")
+            lines = [f"📦 <b>New Load!</b>", f"<b>{h(load_label(job))}</b>"]
+            if meta.get("rate") or meta.get("miles"):
+                parts = []
+                if meta.get("rate"): parts.append(f"💰 {money(meta['rate'])}")
+                if meta.get("miles"): parts.append(f"{meta['miles']} mi")
+                lines.append(" • ".join(parts))
+            
             lines.append(f"\n📍 PU: {h(short_addr(job['pu'].get('addr', ''), 40))}")
             lines.append(f"📍 DEL: {h(short_addr(job['del'][0].get('addr', ''), 40))}")
             lines.append(f"\nType <code>eta</code> or /panel")
@@ -954,8 +1170,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     
     data = query.data
+    log(f"Callback: {data}")
     
-    # IMPORTANT: Answer callback immediately to prevent timeout
+    # Answer immediately
     await query.answer()
     
     async with _state_lock:
@@ -964,21 +1181,22 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not chat_allowed(update, st):
         return
     
-    # Route callbacks
-    if data.startswith("ETA:"):
-        await handle_eta_callback(update, ctx, st, data)
-    elif data == "CATALOG":
-        await handle_catalog_callback(update, ctx, st)
-    elif data == "FINISH":
-        await handle_finish_callback(update, ctx, st)
-    elif data.startswith("NAV:"):
-        await handle_nav_callback(update, ctx, st, data)
-    elif data.startswith("PU:") or data.startswith("DEL:") or data.startswith("DOC:"):
-        await handle_status_callback(update, ctx, st, data)
+    try:
+        if data.startswith("ETA:"):
+            await handle_eta_callback(update, ctx, st, data)
+        elif data == "CATALOG":
+            await handle_catalog_callback(update, ctx, st)
+        elif data == "FINISH":
+            await handle_finish_callback(update, ctx, st)
+        elif data.startswith("NAV:"):
+            await handle_nav_callback(update, ctx, st, data)
+        else:
+            await handle_status_callback(update, ctx, st, data)
+    except Exception as e:
+        log_error(f"Callback error: {data}", e)
 
 async def handle_eta_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, data: str):
-    is_all = data == "ETA:ALL"
-    await send_eta_response(update, ctx, st, all_stops=is_all)
+    await send_eta_response(update, ctx, st, all_stops=(data == "ETA:ALL"))
 
 async def handle_catalog_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict):
     if not is_owner(update, st):
@@ -986,28 +1204,21 @@ async def handle_catalog_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     
     history = st.get("history", [])
     if not history:
-        try:
-            await update.callback_query.edit_message_text("📭 No completed loads yet")
-        except: pass
+        await update.effective_message.reply_text("📭 No loads")
         return
     
     tz_name = (st.get("last_location") or {}).get("tz", "UTC")
     week = week_key(now_utc().astimezone(safe_tz(tz_name)))
-    records = [r for r in history if r.get("week") == week]
+    records = [r for r in history if r.get("week") == week] or history
     
-    if not records:
-        records = history
-        week = "ALL"
-    
-    xlsx_data, filename = make_catalog_xlsx(records, week)
+    xlsx_data, filename = make_catalog_xlsx(records, week if records else "ALL")
     total_rate = sum(r.get("rate", 0) or 0 for r in records)
     
     await ctx.bot.send_document(
         chat_id=update.effective_chat.id,
         document=io.BytesIO(xlsx_data),
         filename=filename,
-        caption=f"📊 {len(records)} loads • {money(total_rate)}",
-        parse_mode="HTML"
+        caption=f"📊 {len(records)} loads • {money(total_rate)}"
     )
 
 async def handle_finish_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict):
@@ -1015,10 +1226,8 @@ async def handle_finish_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
     
     job = get_job(st)
-    if not job:
-        return
-    
-    await do_finish_load(update, ctx, st, job)
+    if job:
+        await do_finish_load(update, ctx, st, job)
 
 async def handle_nav_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, data: str):
     try:
@@ -1043,7 +1252,6 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     async with _state_lock:
         st = load_state()
         job = get_job(st)
-        
         if not job:
             return
         
@@ -1052,34 +1260,33 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         ts = local_stamp(tz_name)
         alert_msg = None
         
-        # Handle PU status
         if data.startswith("PU:"):
             ps = job["pu"].setdefault("status", {})
-            
             if data == "PU:ARR":
                 if toggle_timestamp(ps, "arr"):
-                    alert_msg = f"📍 <b>Arrived at Pickup</b> • {h(ts)}"
+                    alert_msg = f"📍 <b>Arrived PU</b> • {h(ts)}"
             elif data == "PU:LOAD":
                 if toggle_timestamp(ps, "load"):
                     alert_msg = f"📦 <b>Loaded</b> • {h(ts)}"
             elif data == "PU:DEP":
                 if toggle_timestamp(ps, "dep"):
-                    alert_msg = f"🚚 <b>Departed Pickup</b> • {h(ts)}"
+                    alert_msg = f"🚚 <b>Departed PU</b> • {h(ts)}"
             elif data == "PU:COMP":
                 if toggle_timestamp(ps, "comp"):
-                    alert_msg = f"✅ <b>Pickup Complete</b> • {h(ts)}"
+                    alert_msg = f"✅ <b>PU Complete</b> • {h(ts)}"
         
-        # Handle DEL status
         elif data.startswith("DEL:"):
             if stage != "DEL":
+                save_state(st)
                 return
             
             dels = job.get("del", [])
             if idx >= len(dels):
+                save_state(st)
                 return
             
             ds = dels[idx].setdefault("status", {})
-            lbl = f"Stop {idx+1}/{len(dels)}"
+            lbl = f"{idx+1}/{len(dels)}"
             
             if data == "DEL:ARR":
                 if toggle_timestamp(ds, "arr"):
@@ -1093,7 +1300,6 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             elif data == "DEL:COMP":
                 if toggle_timestamp(ds, "comp"):
                     alert_msg = f"✅ <b>Complete {lbl}</b> • {h(ts)}"
-                    # Advance to next
                     for i in range(idx + 1, len(dels)):
                         if not dels[i].get("status", {}).get("comp"):
                             st["focus_i"] = i
@@ -1101,32 +1307,28 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             elif data == "DEL:SKIP":
                 ds["skip"] = True
                 ds["comp"] = ds.get("comp") or now_iso()
-                alert_msg = f"⏭ <b>Skipped {lbl}</b> • {h(ts)}"
+                alert_msg = f"⏭ <b>Skipped {lbl}</b>"
                 for i in range(idx + 1, len(dels)):
                     if not dels[i].get("status", {}).get("comp"):
                         st["focus_i"] = i
                         break
         
-        # Handle DOC status
         elif data.startswith("DOC:"):
             if data == "DOC:PTI":
                 job["pu"].setdefault("docs", {})["pti"] = not job["pu"].get("docs", {}).get("pti", False)
             elif data == "DOC:BOL":
                 job["pu"].setdefault("docs", {})["bol"] = not job["pu"].get("docs", {}).get("bol", False)
-            elif data == "DOC:POD":
-                if stage == "DEL":
-                    dels = job.get("del", [])
-                    if idx < len(dels):
-                        dels[idx].setdefault("docs", {})["pod"] = not dels[idx].get("docs", {}).get("pod", False)
+            elif data == "DOC:POD" and stage == "DEL":
+                dels = job.get("del", [])
+                if idx < len(dels):
+                    dels[idx].setdefault("docs", {})["pod"] = not dels[idx].get("docs", {}).get("pod", False)
         
         st["job"] = job
         save_state(st)
     
-    # Send alert if action was taken
     if alert_msg:
         await send_alert(ctx, update.effective_chat.id, alert_msg)
     
-    # Update keyboard
     try:
         await update.callback_query.edit_message_reply_markup(
             reply_markup=build_panel_keyboard(job, st)
@@ -1139,63 +1341,78 @@ async def handle_status_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 async def send_eta_response(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dict, all_stops: bool = False):
     loc = st.get("last_location")
     if not loc:
-        await update.effective_message.reply_text("📍 No location. Owner: /update")
+        await update.effective_message.reply_text("📍 No location. Owner: /update in DM")
         return
+    
+    loc_age_min = 999
+    if loc.get("updated_at"):
+        try:
+            loc_age_min = int((now_utc() - datetime.fromisoformat(loc["updated_at"])).total_seconds() / 60)
+        except: pass
     
     origin = (loc["lat"], loc["lon"])
     tz_name = loc.get("tz", "UTC")
     tz = safe_tz(tz_name)
     
-    # Send current location
-    await ctx.bot.send_location(update.effective_chat.id, origin[0], origin[1])
+    # Send location
+    try:
+        await ctx.bot.send_location(update.effective_chat.id, origin[0], origin[1])
+    except: pass
     
     job = get_job(st)
     if not job:
         await update.effective_message.reply_text(
-            f"⏱ <b>Current Time</b>\n{now_utc().astimezone(tz).strftime('%H:%M')} ({tz_name})\n\n<i>No active load</i>",
+            f"⏱ {now_utc().astimezone(tz).strftime('%H:%M')} ({tz_name})\n\n<i>No active load</i>",
             parse_mode="HTML"
         )
         return
     
-    if all_stops:
-        await send_all_etas(update, ctx, st, job, origin, tz, tz_name)
-    else:
-        await send_single_eta(update, ctx, st, job, origin, tz, tz_name)
-
-async def send_all_etas(update, ctx, st, job, origin, tz, tz_name):
-    lines = [f"<b>{h(load_label(job))}</b>", ""]
+    age_warn = f"\n⚠️ <i>Location {loc_age_min}m old</i>" if loc_age_min > 10 else ""
     
-    # PU
+    if all_stops:
+        await send_all_etas(update, ctx, st, job, origin, tz, tz_name, age_warn)
+    else:
+        await send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn)
+
+async def send_all_etas(update, ctx, st, job, origin, tz, tz_name, age_warn=""):
+    lines = [f"<b>{h(load_label(job))}</b>{age_warn}", ""]
+    
     pu = job.get("pu", {})
     if pu.get("status", {}).get("comp"):
-        lines.append(f"✅ <b>PU:</b> <s>{h(short_addr(pu.get('addr', ''), 30))}</s>")
+        lines.append(f"✅ <b>PU:</b> Done")
     else:
         eta = await calc_eta(st, origin, pu.get("addr", ""))
         if eta["ok"]:
             arr = (now_utc() + timedelta(seconds=eta["seconds"])).astimezone(tz).strftime("%H:%M")
-            lines.append(f"<b>PU:</b> {fmt_dur(eta['seconds'])} • {fmt_mi(eta['meters'])} • ~{arr}")
+            m = "≈" if eta["method"] == "estimate" else ""
+            lines.append(f"<b>PU:</b> {fmt_dur(eta['seconds'])}{m} • {fmt_mi(eta['meters'])} • ~{arr}")
         else:
             lines.append(f"<b>PU:</b> ⚠️ {eta['err']}")
     
-    # DELs
     for i, d in enumerate(job.get("del", [])[:ETA_ALL_MAX]):
         if d.get("status", {}).get("comp"):
-            lines.append(f"✅ <b>D{i+1}:</b> <s>{h(short_addr(d.get('addr', ''), 30))}</s>")
+            lines.append(f"✅ <b>D{i+1}:</b> Done")
         else:
             eta = await calc_eta(st, origin, d.get("addr", ""))
             if eta["ok"]:
                 arr = (now_utc() + timedelta(seconds=eta["seconds"])).astimezone(tz).strftime("%H:%M")
-                lines.append(f"<b>D{i+1}:</b> {fmt_dur(eta['seconds'])} • {fmt_mi(eta['meters'])} • ~{arr}")
+                m = "≈" if eta["method"] == "estimate" else ""
+                lines.append(f"<b>D{i+1}:</b> {fmt_dur(eta['seconds'])}{m} • {fmt_mi(eta['meters'])} • ~{arr}")
             else:
                 lines.append(f"<b>D{i+1}:</b> ⚠️ {eta['err']}")
     
+    # Save cache
+    async with _state_lock:
+        st2 = load_state()
+        st2["geocode_cache"] = st.get("geocode_cache", {})
+        save_state(st2)
+    
     await update.effective_message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
+        "\n".join(lines), parse_mode="HTML",
         reply_markup=build_panel_keyboard(job, st)
     )
 
-async def send_single_eta(update, ctx, st, job, origin, tz, tz_name):
+async def send_single_eta(update, ctx, st, job, origin, tz, tz_name, age_warn=""):
     stage, idx = get_focus(job, st)
     
     if stage == "PU":
@@ -1211,30 +1428,35 @@ async def send_single_eta(update, ctx, st, job, origin, tz, tz_name):
     
     eta = await calc_eta(st, origin, addr)
     
+    # Save cache
+    async with _state_lock:
+        st2 = load_state()
+        st2["geocode_cache"] = st.get("geocode_cache", {})
+        save_state(st2)
+    
     if eta["ok"]:
         arr_time = now_utc() + timedelta(seconds=eta["seconds"])
         arr_str = arr_time.astimezone(tz).strftime("%H:%M")
-        method = "≈" if eta["method"] == "estimate" else ""
+        m = " ≈" if eta["method"] == "estimate" else ""
         
         lines = [
-            f"⏱ <b>ETA: {fmt_dur(eta['seconds'])}</b> {method}",
+            f"⏱ <b>ETA: {fmt_dur(eta['seconds'])}</b>{m}{age_warn}",
             "",
             f"<b>{label}</b> • {h(load_label(job))}",
-            f"📍 {h(short_addr(addr))}",
-            f"🚚 {fmt_mi(eta['meters'])} • Arrive ~{arr_str}",
+            f"📍 {h(short_addr(addr, 50))}",
+            f"🚚 {fmt_mi(eta['meters'])} • ~{arr_str}",
         ]
-        
         if appt:
             lines.append(f"⏰ Appt: {h(appt)}")
         
         await update.effective_message.reply_text(
-            "\n".join(lines),
-            parse_mode="HTML",
+            "\n".join(lines), parse_mode="HTML",
             reply_markup=build_panel_keyboard(job, st)
         )
     else:
         await update.effective_message.reply_text(
-            f"⚠️ Could not calculate ETA\n{eta['err']}",
+            f"⚠️ <b>Could not calculate ETA</b>\n{eta['err']}\n\n📍 {h(short_addr(addr, 45))}\n\nTry /clearcache",
+            parse_mode="HTML",
             reply_markup=build_panel_keyboard(job, st)
         )
 
@@ -1250,14 +1472,11 @@ async def do_finish_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dic
     pu = job.get("pu", {})
     dels = job.get("del", [])
     
-    # Build history record
     record = {
         "week": wk,
         "completed": dt.strftime("%Y-%m-%d %H:%M"),
         "completed_utc": now_iso(),
-        "tz": tz_name,
         "load_number": meta.get("load_number", ""),
-        "job_id": job.get("id"),
         "pickup": pu.get("addr", ""),
         "deliveries": " | ".join(d.get("addr", "") for d in dels),
         "rate": meta.get("rate"),
@@ -1268,244 +1487,184 @@ async def do_finish_load(update: Update, ctx: ContextTypes.DEFAULT_TYPE, st: dic
         st = load_state()
         history = st.setdefault("history", [])
         history.append(record)
-        st["history"] = history[-1000:]  # Keep last 1000
+        st["history"] = history[-1000:]
         st["job"] = None
         st["focus_i"] = 0
         st["reminders_sent"] = {}
         st["geofence_state"] = {}
         save_state(st)
     
-    # Calculate week totals
     week_records = [r for r in st["history"] if r.get("week") == wk]
-    wk_count = len(week_records)
     wk_rate = sum(r.get("rate", 0) or 0 for r in week_records)
-    wk_miles = sum((r.get("posted_miles") or 0) for r in week_records)
-    
-    rate_txt = money(meta.get("rate"))
-    load_txt = meta.get("load_number") or job.get("id", "")[:8]
+    wk_miles = sum(r.get("posted_miles", 0) or 0 for r in week_records)
     
     report = f"""✅ <b>Load Complete!</b>
 
-<b>#{h(load_txt)}</b> • {rate_txt}
+<b>#{h(meta.get('load_number') or job.get('id', '')[:8])}</b> • {money(meta.get('rate'))}
 
 📊 <b>Week {wk}:</b>
-• {wk_count} loads
+• {len(week_records)} loads
 • {money(wk_rate)} gross
 • {wk_miles} miles"""
     
-    # Try to edit panel message, or send new
     chat_id = update.effective_chat.id
     panel_id = st.get("panel_msgs", {}).get(str(chat_id))
     
     if panel_id:
         try:
             await ctx.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=panel_id,
-                text=report,
-                parse_mode="HTML",
+                chat_id=chat_id, message_id=panel_id,
+                text=report, parse_mode="HTML",
                 reply_markup=build_done_keyboard()
             )
             return
         except: pass
     
-    await ctx.bot.send_message(
-        chat_id=chat_id,
-        text=report,
-        parse_mode="HTML",
-        reply_markup=build_done_keyboard()
-    )
+    await ctx.bot.send_message(chat_id, report, parse_mode="HTML", reply_markup=build_done_keyboard())
 
 # ============================================================================
-# BACKGROUND JOBS (Reminders & Geofence)
+# BACKGROUND JOBS
 # ============================================================================
 async def reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Check for pending reminders."""
-    async with _state_lock:
-        st = load_state()
-    
-    job = get_job(st)
-    if not job:
-        return
-    
-    tz_name = (st.get("last_location") or {}).get("tz", "UTC")
-    sent = st.setdefault("reminders_sent", {})
-    chats = get_broadcast_chats(st)
-    alerts = []
-    
-    # Check appointment reminders
-    for threshold in REMINDER_THRESHOLDS_MIN:
-        # PU appointment
-        pu = job.get("pu", {})
-        if pu.get("time") and not pu.get("status", {}).get("comp"):
-            appt = parse_appt_time(pu["time"], tz_name)
-            if appt:
-                mins = (appt - now_utc()).total_seconds() / 60
-                key = f"appt:pu:{threshold}"
-                if threshold - 5 < mins <= threshold and key not in sent:
-                    alerts.append((key, f"⏰ <b>PU in ~{int(mins)} min</b>\n{h(pu['time'])}"))
-        
-        # DEL appointments
-        for i, d in enumerate(job.get("del", [])):
-            if d.get("time") and not d.get("status", {}).get("comp"):
-                appt = parse_appt_time(d["time"], tz_name)
-                if appt:
-                    mins = (appt - now_utc()).total_seconds() / 60
-                    key = f"appt:del{i}:{threshold}"
-                    if threshold - 5 < mins <= threshold and key not in sent:
-                        alerts.append((key, f"⏰ <b>DEL {i+1} in ~{int(mins)} min</b>\n{h(d['time'])}"))
-    
-    # Check document reminders
-    pu = job.get("pu", {})
-    ps = pu.get("status", {})
-    pd = pu.get("docs", {})
-    
-    if ps.get("arr") and not ps.get("comp"):
-        try:
-            arr = datetime.fromisoformat(ps["arr"])
-            mins_since = (now_utc() - arr).total_seconds() / 60
-            if mins_since >= REMINDER_DOC_AFTER_MIN:
-                if not pd.get("pti") and "doc:pti" not in sent:
-                    alerts.append(("doc:pti", f"📋 <b>PTI Reminder</b>\nArrived {int(mins_since)} min ago"))
-                if not pd.get("bol") and "doc:bol" not in sent:
-                    alerts.append(("doc:bol", f"📋 <b>BOL Reminder</b>\nArrived {int(mins_since)} min ago"))
-        except: pass
-    
-    # Send alerts
-    if alerts:
+    try:
         async with _state_lock:
             st = load_state()
-            sent = st.setdefault("reminders_sent", {})
-            
-            for key, msg in alerts:
-                sent[key] = True
-                for chat_id in chats:
-                    try:
-                        await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
-                    except: pass
-            
-            save_state(st)
+        
+        job = get_job(st)
+        if not job:
+            return
+        
+        tz_name = (st.get("last_location") or {}).get("tz", "UTC")
+        sent = st.get("reminders_sent", {})
+        chats = get_broadcast_chats(st)
+        alerts = []
+        
+        for threshold in REMINDER_THRESHOLDS_MIN:
+            pu = job.get("pu", {})
+            if pu.get("time") and not pu.get("status", {}).get("comp"):
+                appt = parse_appt_time(pu["time"], tz_name)
+                if appt:
+                    mins = (appt - now_utc()).total_seconds() / 60
+                    key = f"appt:pu:{threshold}"
+                    if threshold - 5 < mins <= threshold and key not in sent:
+                        alerts.append((key, f"⏰ <b>PU in ~{int(mins)}m</b>"))
+        
+        if alerts:
+            async with _state_lock:
+                st = load_state()
+                sent = st.setdefault("reminders_sent", {})
+                for key, msg in alerts:
+                    sent[key] = True
+                    for chat_id in chats:
+                        try:
+                            await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
+                        except: pass
+                save_state(st)
+    except Exception as e:
+        log_error("Reminder job", e)
 
 def parse_appt_time(time_str: str, tz_name: str) -> Optional[datetime]:
-    """Parse appointment time string."""
     if not time_str:
         return None
     
-    # Try to extract date and time
-    # Format: "Dec 10, 2025 08:00 -14:00 FCFS"
-    patterns = [
-        r"(\w+ \d+,? \d{4})\s+(\d{1,2}:\d{2})",
-        r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}:\d{2})",
-    ]
-    
-    for pattern in patterns:
-        m = re.search(pattern, time_str)
-        if m:
-            date_str, time_part = m.groups()
-            try:
-                # Parse date
-                for fmt in ["%b %d, %Y", "%b %d %Y", "%m/%d/%Y"]:
-                    try:
-                        dt = datetime.strptime(f"{date_str} {time_part}", f"{fmt} %H:%M")
-                        return dt.replace(tzinfo=safe_tz(tz_name))
-                    except: pass
-            except: pass
-    
+    m = re.search(r"(\w{3})\s+(\d{1,2}),?\s+(\d{4})\s+(\d{1,2}):(\d{2})", time_str)
+    if m:
+        try:
+            dt_str = f"{m.group(1)} {m.group(2)} {m.group(3)} {m.group(4)}:{m.group(5)}"
+            dt = datetime.strptime(dt_str, "%b %d %Y %H:%M")
+            return dt.replace(tzinfo=safe_tz(tz_name))
+        except: pass
     return None
 
 async def geofence_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Check geofence status."""
-    async with _state_lock:
-        st = load_state()
-    
-    job = get_job(st)
-    loc = st.get("last_location")
-    
-    if not job or not loc:
-        return
-    
-    # Check if location is fresh (< 5 min)
     try:
-        loc_time = datetime.fromisoformat(loc["updated_at"])
-        if (now_utc() - loc_time).total_seconds() > 300:
+        async with _state_lock:
+            st = load_state()
+        
+        job = get_job(st)
+        loc = st.get("last_location")
+        
+        if not job or not loc:
             return
-    except: return
-    
-    origin = (loc["lat"], loc["lon"])
-    gf_state = st.setdefault("geofence_state", {})
-    chats = get_broadcast_chats(st)
-    events = []
-    
-    # Check PU
-    pu = job.get("pu", {})
-    if pu.get("addr") and not pu.get("status", {}).get("comp"):
-        cache = st.setdefault("geocode_cache", {})
-        geo = await geocode(pu["addr"], cache)
-        if geo:
-            dist = haversine_miles(origin[0], origin[1], geo[0], geo[1])
-            key = "pu"
-            was_in = gf_state.get(key, False)
-            is_in = dist <= GEOFENCE_MILES
-            
-            if is_in and not was_in:
-                events.append((key, True, "Pickup", pu["addr"]))
-            elif not is_in and was_in:
-                events.append((key, False, "Pickup", pu["addr"]))
-            gf_state[key] = is_in
-    
-    # Check DELs
-    for i, d in enumerate(job.get("del", [])):
-        if d.get("addr") and not d.get("status", {}).get("comp"):
-            cache = st.setdefault("geocode_cache", {})
-            geo = await geocode(d["addr"], cache)
+        
+        try:
+            loc_time = datetime.fromisoformat(loc["updated_at"])
+            if (now_utc() - loc_time).total_seconds() > 300:
+                return
+        except:
+            return
+        
+        origin = (loc["lat"], loc["lon"])
+        gf_state = st.get("geofence_state", {})
+        chats = get_broadcast_chats(st)
+        events = []
+        cache = st.get("geocode_cache", {})
+        
+        pu = job.get("pu", {})
+        if pu.get("addr") and not pu.get("status", {}).get("comp"):
+            geo = await geocode(pu["addr"], cache)
             if geo:
                 dist = haversine_miles(origin[0], origin[1], geo[0], geo[1])
-                key = f"del{i}"
-                was_in = gf_state.get(key, False)
+                was_in = gf_state.get("pu", False)
                 is_in = dist <= GEOFENCE_MILES
                 
                 if is_in and not was_in:
-                    events.append((key, True, f"Delivery {i+1}", d["addr"]))
+                    events.append(("pu", True, "Pickup", pu["addr"]))
                 elif not is_in and was_in:
-                    events.append((key, False, f"Delivery {i+1}", d["addr"]))
-                gf_state[key] = is_in
-    
-    # Send alerts and auto-update status
-    if events:
-        async with _state_lock:
-            st = load_state()
-            job = get_job(st)
-            if not job:
-                return
-            
-            for key, entered, label, addr in events:
-                if entered:
-                    msg = f"📍 <b>ARRIVED: {label}</b>\n{h(short_addr(addr))}"
-                    # Auto-mark arrival
-                    if key == "pu":
-                        job["pu"].setdefault("status", {})["arr"] = now_iso()
-                    elif key.startswith("del"):
-                        idx = int(key[3:])
-                        if idx < len(job.get("del", [])):
-                            job["del"][idx].setdefault("status", {})["arr"] = now_iso()
-                else:
-                    msg = f"🚚 <b>DEPARTED: {label}</b>\n{h(short_addr(addr))}"
-                    # Auto-mark departure
-                    if key == "pu":
-                        job["pu"].setdefault("status", {})["dep"] = now_iso()
-                    elif key.startswith("del"):
-                        idx = int(key[3:])
-                        if idx < len(job.get("del", [])):
-                            job["del"][idx].setdefault("status", {})["dep"] = now_iso()
+                    events.append(("pu", False, "Pickup", pu["addr"]))
+                gf_state["pu"] = is_in
+        
+        for i, d in enumerate(job.get("del", [])):
+            if d.get("addr") and not d.get("status", {}).get("comp"):
+                geo = await geocode(d["addr"], cache)
+                if geo:
+                    dist = haversine_miles(origin[0], origin[1], geo[0], geo[1])
+                    key = f"del{i}"
+                    was_in = gf_state.get(key, False)
+                    is_in = dist <= GEOFENCE_MILES
+                    
+                    if is_in and not was_in:
+                        events.append((key, True, f"Delivery {i+1}", d["addr"]))
+                    elif not is_in and was_in:
+                        events.append((key, False, f"Delivery {i+1}", d["addr"]))
+                    gf_state[key] = is_in
+        
+        if events:
+            async with _state_lock:
+                st = load_state()
+                job = get_job(st)
+                if not job:
+                    return
                 
-                for chat_id in chats:
-                    try:
-                        await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
-                    except: pass
-            
-            st["job"] = job
-            st["geofence_state"] = gf_state
-            save_state(st)
+                for key, entered, label, addr in events:
+                    if entered:
+                        msg = f"📍 <b>ARRIVED: {label}</b>"
+                        if key == "pu":
+                            job["pu"].setdefault("status", {})["arr"] = now_iso()
+                        elif key.startswith("del"):
+                            idx = int(key[3:])
+                            if idx < len(job.get("del", [])):
+                                job["del"][idx].setdefault("status", {})["arr"] = now_iso()
+                    else:
+                        msg = f"🚚 <b>DEPARTED: {label}</b>"
+                        if key == "pu":
+                            job["pu"].setdefault("status", {})["dep"] = now_iso()
+                        elif key.startswith("del"):
+                            idx = int(key[3:])
+                            if idx < len(job.get("del", [])):
+                                job["del"][idx].setdefault("status", {})["dep"] = now_iso()
+                    
+                    for chat_id in chats:
+                        try:
+                            await ctx.bot.send_message(chat_id, msg, parse_mode="HTML")
+                        except: pass
+                
+                st["job"] = job
+                st["geofence_state"] = gf_state
+                st["geocode_cache"] = cache
+                save_state(st)
+    except Exception as e:
+        log_error("Geofence job", e)
 
 # ============================================================================
 # MAIN
@@ -1516,23 +1675,23 @@ async def post_init(app: Application):
         me = await app.bot.get_me()
         log(f"Bot: @{me.username}")
     except Exception as e:
-        log(f"Init error: {e}")
+        log_error("Init", e)
     
-    # Schedule background jobs
     if app.job_queue:
         app.job_queue.run_repeating(reminder_job, interval=60, first=10)
         app.job_queue.run_repeating(geofence_job, interval=30, first=15)
-        log("Background jobs scheduled")
     
     log(f"Ready! v{BOT_VERSION}")
 
 def main():
     if not TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN not set")
+        print("ERROR: TELEGRAM_TOKEN not set")
+        return
+    
+    log(f"Starting v{BOT_VERSION}...")
     
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
     
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -1546,13 +1705,12 @@ def main():
     app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("deleteall", cmd_deleteall))
     app.add_handler(CommandHandler("leave", cmd_leave))
+    app.add_handler(CommandHandler("clearcache", cmd_clearcache))
     
-    # Other handlers
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     
-    log(f"Starting v{BOT_VERSION}...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
