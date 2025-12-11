@@ -41,7 +41,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "2025-12-11_geocoding_fix_v2"
+BOT_VERSION = "2025-12-11_reset_feature_v1"
 
 
 # ============================================================================
@@ -1338,7 +1338,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• /finish (owner)\n"
         "• /catalog (owner)\n\n"
         "<b>Tools:</b>\n"
-        "• /skip • /leave • /deleteall\n\n"
+        "• /skip • /reset • /deleteall • /leave\n\n"
         "<b>Debug:</b>\n"
         "• /status • /ping",
         parse_mode="HTML"
@@ -1745,6 +1745,30 @@ async def deleteall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Check if bot is admin
+    try:
+        bot_member = await ctx.bot.get_chat_member(chat.id, ctx.bot.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await update.effective_message.reply_text(
+                "❌ <b>Bot is not admin!</b>\n\n"
+                "<b>To enable /deleteall:</b>\n"
+                "1. Tap this group name at top\n"
+                "2. Tap 'Edit' → 'Administrators'\n"
+                "3. Tap 'Add Administrator'\n"
+                "4. Select this bot\n"
+                "5. Enable 'Delete Messages' permission\n"
+                "6. Tap 'Done'\n\n"
+                "Then try /deleteall again.",
+                parse_mode="HTML"
+            )
+            return
+    except Exception as e:
+        log(f"Error checking admin status: {e}")
+        await update.effective_message.reply_text(
+            "⚠️ Couldn't verify permissions. Bot may need to be added as admin."
+        )
+        return
+
     n = DELETEALL_DEFAULT
     if ctx.args:
         try:
@@ -1753,19 +1777,160 @@ async def deleteall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
     notice = await update.effective_message.reply_text(
-        f"🧹 Deleting up to {n} messages… (bot must be admin)"
+        f"🧹 Starting cleanup... (deleting up to {n} messages)"
     )
+    
     start_id = notice.message_id
+    deleted_count = 0
+    failed_count = 0
 
-    for mid in range(start_id, max(1, start_id - n + 1) - 1, -1):
+    # Delete messages going backwards from current message
+    for mid in range(start_id, max(1, start_id - n) - 1, -1):
         try:
             await ctx.bot.delete_message(chat_id=chat.id, message_id=mid)
-        except (Forbidden, BadRequest):
-            break
-        await asyncio.sleep(0.02)
+            deleted_count += 1
+            # Small delay to avoid rate limits
+            if deleted_count % 20 == 0:
+                await asyncio.sleep(0.5)
+            else:
+                await asyncio.sleep(0.05)
+        except Forbidden:
+            # Bot doesn't have permission
+            failed_count += 1
+            if failed_count > 10:
+                # Too many permission errors, stop trying
+                await ctx.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"⚠️ Stopped after {deleted_count} messages. Bot may have lost admin permissions."
+                )
+                return
+        except BadRequest:
+            # Message doesn't exist or can't be deleted
+            failed_count += 1
+            if failed_count > 50:
+                # Too many missing messages, probably reached the end
+                break
+        except Exception as e:
+            log(f"Error deleting message {mid}: {e}")
+            failed_count += 1
+
+    # Send completion message
+    try:
+        completion_msg = await ctx.bot.send_message(
+            chat_id=chat.id,
+            text=f"✅ Cleanup complete! Deleted {deleted_count} messages."
+        )
+        # Auto-delete completion message after 10 seconds
+        await asyncio.sleep(10)
+        try:
+            await ctx.bot.delete_message(chat_id=chat.id, message_id=completion_msg.message_id)
+        except:
+            pass
+    except Exception as e:
+        log(f"Error sending completion message: {e}")
 
 
-async def leave_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Reset bot to default state (owner only)."""
+    async with _state_lock:
+        st = load_state()
+        
+        if not is_owner(update, st):
+            await update.effective_message.reply_text("Owner only.")
+            return
+
+    # Show confirmation buttons
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Yes, Reset Everything", callback_data="RESET:CONFIRM"),
+            InlineKeyboardButton("❌ Cancel", callback_data="RESET:CANCEL")
+        ]
+    ])
+
+    await update.effective_message.reply_text(
+        "⚠️ <b>Reset Bot Data?</b>\n\n"
+        "This will permanently delete:\n"
+        "• Active load\n"
+        "• Load history (all weeks)\n"
+        "• Geocoding cache\n"
+        "• All progress tracking\n\n"
+        "<b>Keeps:</b>\n"
+        "• Your ownership\n"
+        "• Allowed groups\n"
+        "• Your location\n\n"
+        "Are you sure?",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+async def handle_reset_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str):
+    """Handle reset confirmation callbacks."""
+    q = update.callback_query
+    
+    async with _state_lock:
+        st = load_state()
+        
+        if not is_owner(update, st):
+            await q.answer("Owner only.", show_alert=True)
+            return
+
+    if action == "CANCEL":
+        await q.answer("Reset cancelled.", show_alert=False)
+        try:
+            await q.edit_message_text("❌ Reset cancelled. No data was deleted.")
+        except TelegramError:
+            pass
+        return
+
+    if action == "CONFIRM":
+        await q.answer("Resetting bot...", show_alert=False)
+        
+        async with _state_lock:
+            st2 = load_state()
+            
+            # Keep only essential data
+            owner_id = st2.get("owner_id")
+            allowed_chats = st2.get("allowed_chats", [])
+            last_location = st2.get("last_location")
+            
+            # Create fresh state
+            new_state = {
+                "owner_id": owner_id,
+                "owner": owner_id,
+                "allowed_chats": allowed_chats,
+                "allowed": allowed_chats,
+                "last_location": last_location,
+                "last": last_location,
+                "job": None,
+                "focus_i": 0,
+                "geocode_cache": {},
+                "gc": {},
+                "history": [],
+                "hist": [],
+                "last_finished": None,
+                "panel_messages": {}
+            }
+            
+            save_state(new_state)
+        
+        try:
+            await q.edit_message_text(
+                "✅ <b>Bot Reset Complete!</b>\n\n"
+                "Deleted:\n"
+                "• All load history\n"
+                "• Active load\n"
+                "• Geocoding cache\n"
+                "• Progress tracking\n\n"
+                "Kept:\n"
+                "• Your ownership\n"
+                "• Allowed groups\n"
+                "• Your location\n\n"
+                "Bot is ready for new loads!",
+                parse_mode="HTML"
+            )
+        except TelegramError:
+            pass
     """Leave a group chat."""
     async with _state_lock:
         st = load_state()
@@ -1813,6 +1978,13 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Not allowed here.", show_alert=False)
         return
 
+    # Reset confirmation callbacks
+    if data.startswith("RESET:"):
+        action = data.split(":", 1)[1]
+        await handle_reset_callback(update, ctx, action)
+        return
+
+    # ETA requests
     if data.startswith("ETA:"):
         await q.answer("Computing ETA…", show_alert=False)
         await send_eta(update, ctx, data.split(":", 1)[1])
@@ -2080,6 +2252,7 @@ def main() -> None:
     app.add_handler(CommandHandler("finish", finish_cmd))
     app.add_handler(CommandHandler("catalog", catalog_cmd))
     app.add_handler(CommandHandler("skip", skip_cmd))
+    app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("deleteall", deleteall_cmd))
     app.add_handler(CommandHandler("leave", leave_cmd))
 
