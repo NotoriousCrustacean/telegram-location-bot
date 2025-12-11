@@ -41,7 +41,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "2025-12-11_enhanced_v1"
+BOT_VERSION = "2025-12-11_geocoding_fix_v2"
 
 
 # ============================================================================
@@ -362,7 +362,7 @@ def fmt_mi(meters: float) -> str:
 
 
 def addr_variants(addr: str) -> List[str]:
-    """Generate address variants for geocoding."""
+    """Generate address variants for geocoding with improved parsing."""
     # Normalize whitespace and add spaces after commas
     a = " ".join((addr or "").split())
     a = re.sub(r',(?=\S)', ', ', a)  # Add space after comma if missing
@@ -370,37 +370,49 @@ def addr_variants(addr: str) -> List[str]:
     if not a:
         return []
     
-    out = [a]
+    out = []
     parts = [p.strip() for p in a.split(",") if p.strip()]
     
-    # Remove building/gate/suite info from first line
-    first_clean = re.sub(r'\b(?:BLDG|BLD|BUILDING|GATE|SUITE|STE|UNIT|#)\s*[\w\-]+\b', '', parts[0] if parts else '', flags=re.I).strip()
-    if first_clean and len(parts) > 1:
-        out.append(", ".join([first_clean] + parts[1:]))
+    # Find street address (contains numbers and street keywords)
+    street = None
+    for part in parts:
+        if re.search(r'\d+.*(?:road|rd|street|st|avenue|ave|lane|ln|drive|dr|blvd|boulevard|way|court|ct|circle|cir)', part, re.I):
+            # Clean building/gate/suite info from street
+            street = re.sub(r'\b(?:bldg|bld|building|gate|suite|ste|unit|#)\s*[\w\-]+\b', '', part, flags=re.I).strip()
+            break
     
-    # Try without first part entirely (building/suite)
-    if len(parts) >= 2:
-        out.append(", ".join(parts[1:]))
+    # Variant 1: Street + last 2 parts (city, state+zip)
+    if street and len(parts) >= 2:
+        out.append(", ".join([street] + parts[-2:]))
     
-    # Try just street + city + state + zip (skip building details)
-    if len(parts) >= 3:
-        # Find the part that looks like a street (has numbers)
-        street_parts = [p for p in parts if re.search(r'\d+', p)]
-        if street_parts:
-            out.append(", ".join([street_parts[0]] + parts[-2:]))
+    # Variant 2: Street + city + state (no zip)
+    if street and len(parts) >= 3:
+        # Try to find state abbreviation
+        for i, part in enumerate(parts):
+            if re.search(r'\b[A-Z]{2}\b', part):
+                out.append(", ".join([street, parts[i-1] if i > 0 else parts[-2], part.split()[0]]))
+                break
     
-    # Try last three parts (street, city, state/zip)
-    if len(parts) >= 3:
-        out.append(", ".join(parts[-3:]))
-    
-    # Try last two parts (city, state/zip)
+    # Variant 3: City + State + ZIP
     if len(parts) >= 2:
         out.append(", ".join(parts[-2:]))
     
-    # Add USA if not present
-    if "usa" not in a.lower():
-        out.append(a + ", USA")
-
+    # Variant 4: Just ZIP code + USA
+    for part in parts:
+        zip_match = re.search(r'\b(\d{5}(?:-\d{4})?)\b', part)
+        if zip_match:
+            out.append(zip_match.group(1) + ", USA")
+    
+    # Variant 5: City + State only (no ZIP)
+    if len(parts) >= 2:
+        for i, part in enumerate(parts):
+            if re.search(r'\b[A-Z]{2}\b', part):
+                if i > 0:
+                    out.append(f"{parts[i-1]}, {part.split()[0]}")
+    
+    # Variant 6: Original with spaces fixed
+    out.insert(0, a)
+    
     # Deduplicate while preserving order
     seen, res = set(), []
     for x in out:
@@ -412,13 +424,14 @@ def addr_variants(addr: str) -> List[str]:
 
 
 async def geocode_cached(st: dict, addr: str) -> Optional[Tuple[float, float, str]]:
-    """Geocode address with caching."""
+    """Geocode address with caching and detailed logging."""
     cache = st.get("geocode_cache") or {}
     
     # Check cache
     if addr in cache and isinstance(cache[addr], dict):
         try:
             v = cache[addr]
+            log(f"✓ Cache hit for: {addr[:50]}")
             return float(v["lat"]), float(v["lon"]), (v.get("tz") or "UTC")
         except (ValueError, TypeError, KeyError):
             pass
@@ -430,7 +443,12 @@ async def geocode_cached(st: dict, addr: str) -> Optional[Tuple[float, float, st
     headers = {"User-Agent": NOMINATIM_USER_AGENT}
     
     async with httpx.AsyncClient(timeout=15, headers=headers) as client:
-        for query in addr_variants(addr):
+        variants = addr_variants(addr)
+        log(f"Trying {len(variants)} address variants for: {addr[:60]}...")
+        
+        for idx, query in enumerate(variants):
+            log(f"  Variant {idx+1}/{len(variants)}: {query[:80]}")
+            
             # Rate limiting
             async with _geo_lock:
                 global _geo_last
@@ -442,24 +460,28 @@ async def geocode_cached(st: dict, addr: str) -> Optional[Tuple[float, float, st
                     r = await client.get(NOM_URL, params={"q": query, "format": "jsonv2", "limit": 1})
                     _geo_last = time.monotonic()
                 except Exception as e:
-                    log(f"Geocoding error for '{query}': {e}")
+                    log(f"    ✗ Request error: {e}")
                     continue
 
             if r.status_code >= 400:
+                log(f"    ✗ HTTP {r.status_code}")
                 continue
             
             try:
                 js = r.json() or []
             except Exception as e:
-                log(f"JSON parse error: {e}")
+                log(f"    ✗ JSON parse error: {e}")
                 continue
                 
             if not js:
+                log(f"    ✗ No results")
                 continue
 
             try:
                 lat, lon = float(js[0]["lat"]), float(js[0]["lon"])
                 tz = TF.timezone_at(lat=lat, lng=lon) or "UTC"
+                
+                log(f"    ✓ SUCCESS: {lat:.4f}, {lon:.4f} ({tz})")
                 
                 # Update cache
                 cache[addr] = {"lat": lat, "lon": lon, "tz": tz}
@@ -474,9 +496,10 @@ async def geocode_cached(st: dict, addr: str) -> Optional[Tuple[float, float, st
 
                 return lat, lon, tz
             except (ValueError, TypeError, KeyError, IndexError) as e:
-                log(f"Error parsing geocode result: {e}")
+                log(f"    ✗ Parse error: {e}")
                 continue
 
+    log(f"  ✗ All {len(variants)} variants failed for: {addr[:60]}")
     return None
 
 
@@ -554,7 +577,7 @@ DEL_TIME_RE = re.compile(r"^\s*DEL time:\s*(.+)$", re.I)
 PU_ADDR_RE = re.compile(r"^\s*PU Address\s*:\s*(.*)$", re.I)
 DEL_ADDR_RE = re.compile(r"^\s*DEL Address(?:\s*\d+)?\s*:\s*(.*)$", re.I)
 
-LOAD_NUM_RE = re.compile(r"^\s*Load Number\s*:\s*(.+)$", re.I)
+LOAD_NUM_RE = re.compile(r"^\s*Load\s*(?:Number|#)\s*:?\s*(.+)$", re.I)
 LOAD_DATE_RE = re.compile(r"^\s*Load Date\s*:\s*(.+)$", re.I)
 PICKUP_RE = re.compile(r"^\s*Pickup\s*:\s*(.+)$", re.I)
 DELIVERY_RE = re.compile(r"^\s*Delivery\s*:\s*(.+)$", re.I)
@@ -1012,12 +1035,11 @@ async def finish_active_load(
         st2 = load_state()
         hist = list(st2.get("history") or [])
         hist.append(rec)
-        st2["history"] = hist[-1000:]  # Keep last 1000
+        st2["history"] = hist[-1000:]
         st2["last_finished"] = rec
         st2["job"] = None
         st2["focus_i"] = 0
         
-        # Clear panel message for this chat
         if chat_id is not None:
             pm = st2.get("panel_messages") or {}
             pm.pop(str(chat_id), None)
@@ -1082,7 +1104,7 @@ def autosize_columns(ws, min_w: int = 10, max_w: int = 60) -> None:
 
 def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
     """Write a weekly sheet to workbook."""
-    name = wk[:31]  # Excel sheet name limit
+    name = wk[:31]
     ws = wb.create_sheet(title=name)
 
     def _sort_key(r: dict):
@@ -1091,11 +1113,9 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
 
     records = sorted(records, key=_sort_key)
 
-    # Title
     ws.append([f"Weekly Loads — {wk}"])
     ws["A1"].font = Font(bold=True, size=14)
 
-    # Headers
     headers = [
         "Completed (Local)",
         "TZ",
@@ -1119,7 +1139,6 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
     sum_rate = 0.0
     sum_miles = 0.0
 
-    # Data rows
     for r in records:
         completed_dt = try_parse_dt(r.get("completed")) or try_parse_dt(r.get("completed_utc"))
         load_date = try_parse_date(r.get("load_date"))
@@ -1156,7 +1175,6 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
         if use is not None:
             sum_miles += float(use)
 
-    # Totals row
     ws.append([])
     ws.append([
         "TOTAL",
@@ -1177,7 +1195,6 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
     for c in ws[ws.max_row]:
         c.font = Font(bold=True)
 
-    # Format cells
     for row in ws.iter_rows(min_row=3, max_row=ws.max_row):
         if isinstance(row[0].value, datetime):
             row[0].number_format = "yyyy-mm-dd hh:mm"
@@ -1202,7 +1219,6 @@ def make_xlsx_weekly(records: List[dict], wk: str) -> Tuple[bytes, str]:
     """Generate Excel file for week(s)."""
     wb = Workbook()
     
-    # Remove default sheet
     try:
         wb.remove(wb.active)
     except Exception:
@@ -1475,7 +1491,6 @@ async def panel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reply_markup=build_keyboard(job, st),
     )
 
-    # Remember panel message ID
     async with _state_lock:
         st2 = load_state()
         pm = st2.get("panel_messages") or {}
@@ -1495,7 +1510,6 @@ async def finish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rate_txt = money(rec.get("rate") if isinstance(rec.get("rate"), (int, float)) else None)
     id_txt = rec.get("load_number") or rec.get("job_id") or ""
 
-    # Short alert
     await send_progress_alert(
         ctx, 
         update.effective_chat.id, 
@@ -1513,7 +1527,6 @@ async def finish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📊 Tap Catalog for Excel.",
     ])
 
-    # Try to edit panel message
     chat_id = update.effective_chat.id
     pm = (st2.get("panel_messages") or {})
     msg_id = pm.get(str(chat_id))
@@ -1531,7 +1544,6 @@ async def finish_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
 
-    # Fallback: send new message
     await ctx.bot.send_message(
         chat_id=chat_id, 
         text=report, 
@@ -1801,18 +1813,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("Not allowed here.", show_alert=False)
         return
 
-    # ETA requests
     if data.startswith("ETA:"):
         await q.answer("Computing ETA…", show_alert=False)
         await send_eta(update, ctx, data.split(":", 1)[1])
         return
 
-    # Catalog request
     if data == "SHOW:CAT":
         await send_catalog(update, ctx, from_callback=True)
         return
 
-    # Finish job
     if data == "JOB:FIN":
         if not is_owner(update, st):
             await q.answer("Owner only. DM /claim <code>.", show_alert=True)
@@ -1858,7 +1867,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # Progress button updates
     async with _state_lock:
         st2 = load_state()
         job = normalize_job(st2.get("job"))
@@ -1878,7 +1886,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         progress_broadcast: Optional[str] = None
 
-        # Pickup actions
         if data.startswith("PU:"):
             ps = job["pu"]["status"]
             
@@ -1902,7 +1909,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     if ni is not None:
                         st2["focus_i"] = ni
 
-        # Delivery actions
         elif data.startswith("DEL:"):
             if stage != "DEL":
                 await q.answer("Complete PU first.", show_alert=False)
@@ -1949,7 +1955,6 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             dels[i] = dd
             job["del"] = dels
 
-        # Document toggles
         elif data.startswith("DOC:"):
             if data == "DOC:PTI":
                 job["pu"]["docs"]["pti"] = not bool(job["pu"]["docs"].get("pti"))
@@ -1998,7 +2003,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat = update.effective_chat
 
-    # Detect new loads only in allowed groups
     if chat and chat.type in ("group", "supergroup"):
         if chat.id not in set(st.get("allowed_chats") or []):
             return
@@ -2014,7 +2018,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("📦 New load detected. Type eta / 1717 or /panel.")
             return
 
-    # Trigger words in allowed chats
     if not chat_allowed(update, st):
         return
 
@@ -2067,7 +2070,6 @@ def main() -> None:
 
     app = builder.build()
 
-    # Register command handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -2081,10 +2083,8 @@ def main() -> None:
     app.add_handler(CommandHandler("deleteall", deleteall_cmd))
     app.add_handler(CommandHandler("leave", leave_cmd))
 
-    # Register callback handler
     app.add_handler(CallbackQueryHandler(on_callback))
     
-    # Register location handlers
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
     try:
         app.add_handler(
@@ -2096,7 +2096,6 @@ def main() -> None:
     except Exception as e:
         log(f"Failed to add edited location handler: {e}")
 
-    # Register text handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log("Starting polling…")
