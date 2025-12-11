@@ -363,21 +363,37 @@ def fmt_mi(meters: float) -> str:
 
 def addr_variants(addr: str) -> List[str]:
     """Generate address variants for geocoding."""
+    # Normalize whitespace and add spaces after commas
     a = " ".join((addr or "").split())
+    a = re.sub(r',(?=\S)', ', ', a)  # Add space after comma if missing
+    
     if not a:
         return []
     
     out = [a]
     parts = [p.strip() for p in a.split(",") if p.strip()]
     
-    # Try without first part (building/suite)
+    # Remove building/gate/suite info from first line
+    first_clean = re.sub(r'\b(?:BLDG|BLD|BUILDING|GATE|SUITE|STE|UNIT|#)\s*[\w\-]+\b', '', parts[0] if parts else '', flags=re.I).strip()
+    if first_clean and len(parts) > 1:
+        out.append(", ".join([first_clean] + parts[1:]))
+    
+    # Try without first part entirely (building/suite)
     if len(parts) >= 2:
         out.append(", ".join(parts[1:]))
     
-    # Remove suite/unit numbers
-    out.append(re.sub(r"\b(?:suite|ste|unit|#)\s*[\w\-]+\b", "", a, flags=re.I).strip())
+    # Try just street + city + state + zip (skip building details)
+    if len(parts) >= 3:
+        # Find the part that looks like a street (has numbers)
+        street_parts = [p for p in parts if re.search(r'\d+', p)]
+        if street_parts:
+            out.append(", ".join([street_parts[0]] + parts[-2:]))
     
-    # Try last two parts (city, state)
+    # Try last three parts (street, city, state/zip)
+    if len(parts) >= 3:
+        out.append(", ".join(parts[-3:]))
+    
+    # Try last two parts (city, state/zip)
     if len(parts) >= 2:
         out.append(", ".join(parts[-2:]))
     
