@@ -1,14 +1,4 @@
-# Trucker Dispatch Bot
-# Python 3.9+ required
-
-# Telegram Bot with background job support
-python-telegram-bot[job-queue]==21.6
-
-# Async HTTP client
-httpx==0.27.2
-
-# Timezone from coordinates
-timezonefinder==6.5.2
-
-# Excel export
-openpyxl==3.1.5
+python-telegram-bot==20.7
+httpx==0.25.2
+openpyxl==3.1.2
+timezonefinder==6.2.0
