@@ -41,7 +41,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_VERSION = "2025-12-11_reset_feature_v1"
+BOT_VERSION = "2025-12-11_pdf_docs_v1"
 
 
 # ============================================================================
@@ -255,6 +255,9 @@ def _migrate_state(st: dict) -> Tuple[dict, bool]:
     st.setdefault("history", [])
     st.setdefault("last_finished", None)
     st.setdefault("panel_messages", {})
+    st.setdefault("documents", {})  # {load_number_or_job_id: [{file_id, type, filename, timestamp, chat_id}]}
+    st.setdefault("documents", {})  # {load_id: [{type, file_id, file_name, added_at}, ...]}
+    st.setdefault("pending_doc", None)  # {file_id, file_name, message_id, chat_id}
 
     # Mirror legacy keys
     st["owner"] = st.get("owner_id")
@@ -582,6 +585,16 @@ LOAD_DATE_RE = re.compile(r"^\s*Load Date\s*:\s*(.+)$", re.I)
 PICKUP_RE = re.compile(r"^\s*Pickup\s*:\s*(.+)$", re.I)
 DELIVERY_RE = re.compile(r"^\s*Delivery\s*:\s*(.+)$", re.I)
 TIMEISH = re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2})\b")
+
+# Document types for PDF storage
+DOC_TYPES = {
+    "RC": "Rate Confirmation",
+    "BOL": "Bill of Lading",
+    "POD": "Proof of Delivery",
+    "LUMPER": "Lumper Receipt",
+    "SCALE": "Scale Ticket",
+    "OTHER": "Other Document",
+}
 
 
 def extract_rate_miles(text: str) -> Tuple[Optional[float], Optional[int]]:
@@ -941,7 +954,7 @@ def build_keyboard(job: dict, st: dict) -> InlineKeyboardMarkup:
         ])
 
     rows.append([b("ETA", "ETA:A"), b("ETA all", "ETA:ALL")])
-    rows.append([b("📊 Catalog", "SHOW:CAT"), b("Finish Load", "JOB:FIN")])
+    rows.append([b("📎 Docs", "SHOW:DOCS"), b("📊 Catalog", "SHOW:CAT"), b("Finish Load", "JOB:FIN")])
     
     return InlineKeyboardMarkup(rows)
 
@@ -1011,6 +1024,11 @@ async def finish_active_load(
     dels = job.get("del") or []
     del_times = " | ".join(((d.get("time") or "").strip() or "-") for d in dels)
 
+    # Get document count for this load
+    load_key = get_load_key(job)
+    all_docs = st.get("documents") or {}
+    load_docs = all_docs.get(load_key, []) if load_key else []
+
     rec = {
         "week": wk,
         "completed": dt_local.strftime("%Y-%m-%d %H:%M"),
@@ -1027,6 +1045,7 @@ async def finish_active_load(
         "rate": meta.get("rate"),
         "posted_miles": meta.get("miles"),
         "est_miles": est,
+        "documents": len(load_docs),
     }
 
     chat_id = update.effective_chat.id if update.effective_chat else None
@@ -1131,6 +1150,7 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
         "Posted Miles",
         "Est Miles",
         "Rate/EstMi",
+        "Docs",
     ]
     ws.append(headers)
     for c in ws[2]:
@@ -1167,6 +1187,7 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
             float(posted) if isinstance(posted, (int, float)) else None,
             float(est) if isinstance(est, (int, float)) else None,
             float(rpm) if isinstance(rpm, (int, float)) else None,
+            r.get("documents") or 0,
         ])
 
         if isinstance(rate, (int, float)):
@@ -1191,6 +1212,7 @@ def write_week_sheet(wb: Workbook, wk: str, records: List[dict]) -> None:
         "",
         sum_miles,
         (sum_rate / sum_miles) if sum_miles else None,
+        "",
     ])
     for c in ws[ws.max_row]:
         c.font = Font(bold=True)
@@ -1336,7 +1358,10 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Usage:</b>\n"
         "• eta / 1717 or /panel\n"
         "• /finish (owner)\n"
-        "• /catalog (owner)\n\n"
+        "• /catalog (owner)\n"
+        "• /docs (view saved PDFs)\n\n"
+        "<b>Documents:</b>\n"
+        "📎 Upload PDFs while a load is active to save BOLs, PODs, etc.\n\n"
         "<b>Tools:</b>\n"
         "• /skip • /reset • /deleteall • /leave\n\n"
         "<b>Debug:</b>\n"
@@ -1359,6 +1384,8 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     allowed_here = chat_allowed(update, st)
     loc = st.get("last_location")
     job = normalize_job(st.get("job"))
+    all_docs = st.get("documents") or {}
+    total_docs = sum(len(docs) for docs in all_docs.values())
 
     lines = [
         f"<b>Status</b> ({h(BOT_VERSION)})",
@@ -1370,6 +1397,7 @@ async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<b>Location saved:</b> {'✅' if loc else '❌'}",
         f"<b>Active load:</b> {'✅' if job else '❌'}",
         f"<b>History rows:</b> {h(len(st.get('history') or []))}",
+        f"<b>Saved documents:</b> {h(total_docs)} across {h(len(all_docs))} loads",
     ]
     
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -1963,6 +1991,265 @@ async def leave_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================================
+# DOCUMENT (PDF) HANDLING
+# ============================================================================
+
+def get_load_key(job: Optional[dict]) -> Optional[str]:
+    """Get a unique key for the load (load_number preferred, else job_id)."""
+    if not job:
+        return None
+    meta = job.get("meta") or {}
+    return meta.get("load_number") or job.get("id")
+
+
+def build_doc_type_keyboard(file_unique_id: str) -> InlineKeyboardMarkup:
+    """Build keyboard for document type selection."""
+    return InlineKeyboardMarkup([
+        [
+            b("📄 BOL", f"DOC_SAVE:BOL:{file_unique_id}"),
+            b("📋 POD", f"DOC_SAVE:POD:{file_unique_id}"),
+        ],
+        [
+            b("💰 Rate Con", f"DOC_SAVE:RATE:{file_unique_id}"),
+            b("📁 Other", f"DOC_SAVE:OTHER:{file_unique_id}"),
+        ],
+        [
+            b("❌ Don't Save", f"DOC_SAVE:CANCEL:{file_unique_id}"),
+        ]
+    ])
+
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle document uploads (PDFs)."""
+    msg = update.effective_message
+    if not msg or not msg.document:
+        return
+
+    doc = msg.document
+    
+    # Only process PDFs
+    if doc.mime_type != "application/pdf":
+        return
+
+    async with _state_lock:
+        st = load_state()
+
+    # Check if chat is allowed
+    if not chat_allowed(update, st):
+        return
+
+    # Check if there's an active load
+    job = normalize_job(st.get("job"))
+    if not job:
+        # No active load - ignore silently or notify
+        return
+
+    load_key = get_load_key(job)
+    if not load_key:
+        return
+
+    # Store file info temporarily in context for the callback
+    pending_docs = ctx.bot_data.setdefault("pending_docs", {})
+    pending_docs[doc.file_unique_id] = {
+        "file_id": doc.file_id,
+        "file_unique_id": doc.file_unique_id,
+        "filename": doc.file_name or "document.pdf",
+        "load_key": load_key,
+        "chat_id": update.effective_chat.id,
+        "timestamp": now_iso(),
+    }
+
+    load_label = load_id_text(job)
+    await msg.reply_text(
+        f"📎 <b>PDF Detected</b>\n"
+        f"<code>{h(doc.file_name or 'document.pdf')}</code>\n\n"
+        f"Save this document for <b>{h(load_label)}</b>?\n"
+        f"Select document type:",
+        parse_mode="HTML",
+        reply_markup=build_doc_type_keyboard(doc.file_unique_id),
+    )
+
+
+async def handle_doc_save_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE, doc_type: str, file_unique_id: str):
+    """Handle document save callbacks."""
+    q = update.callback_query
+
+    # Get pending doc info
+    pending_docs = ctx.bot_data.get("pending_docs", {})
+    doc_info = pending_docs.get(file_unique_id)
+
+    if not doc_info:
+        await q.answer("Document expired. Please re-upload.", show_alert=True)
+        try:
+            await q.edit_message_text("❌ Document expired. Please upload again.")
+        except TelegramError:
+            pass
+        return
+
+    if doc_type == "CANCEL":
+        await q.answer("Document not saved.", show_alert=False)
+        try:
+            await q.edit_message_text("❌ Document not saved.")
+        except TelegramError:
+            pass
+        # Clean up
+        pending_docs.pop(file_unique_id, None)
+        return
+
+    # Map type to friendly name
+    type_names = {
+        "BOL": "Bill of Lading",
+        "POD": "Proof of Delivery", 
+        "RATE": "Rate Confirmation",
+        "OTHER": "Other Document",
+    }
+    type_name = type_names.get(doc_type, doc_type)
+
+    # Save to state
+    async with _state_lock:
+        st = load_state()
+        docs = st.get("documents") or {}
+        load_key = doc_info["load_key"]
+        
+        if load_key not in docs:
+            docs[load_key] = []
+        
+        docs[load_key].append({
+            "file_id": doc_info["file_id"],
+            "type": doc_type,
+            "type_name": type_name,
+            "filename": doc_info["filename"],
+            "timestamp": doc_info["timestamp"],
+            "chat_id": doc_info["chat_id"],
+        })
+        
+        st["documents"] = docs
+        save_state(st)
+
+    await q.answer(f"✅ Saved as {type_name}", show_alert=False)
+    try:
+        await q.edit_message_text(
+            f"✅ <b>Document Saved</b>\n"
+            f"<code>{h(doc_info['filename'])}</code>\n"
+            f"Type: <b>{h(type_name)}</b>\n"
+            f"Load: <b>{h(load_key)}</b>\n\n"
+            f"Use /docs to view saved documents.",
+            parse_mode="HTML"
+        )
+    except TelegramError:
+        pass
+
+    # Clean up
+    pending_docs.pop(file_unique_id, None)
+
+
+async def docs_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /docs command - list and retrieve documents."""
+    async with _state_lock:
+        st = load_state()
+
+    if not is_owner(update, st):
+        await update.effective_message.reply_text("Owner only.")
+        return
+
+    if not chat_allowed(update, st):
+        await update.effective_message.reply_text("This chat isn't allowed.")
+        return
+
+    all_docs = st.get("documents") or {}
+    
+    # Check for argument (specific load number)
+    args = ctx.args or []
+    
+    if args:
+        # Looking for specific load
+        search = " ".join(args).strip()
+        
+        # Try exact match first
+        if search in all_docs:
+            load_key = search
+        else:
+            # Try partial match
+            matches = [k for k in all_docs.keys() if search.lower() in k.lower()]
+            if len(matches) == 1:
+                load_key = matches[0]
+            elif len(matches) > 1:
+                await update.effective_message.reply_text(
+                    f"Multiple loads match '{h(search)}':\n" + 
+                    "\n".join(f"• {h(m)}" for m in matches[:10]) +
+                    "\n\nBe more specific.",
+                    parse_mode="HTML"
+                )
+                return
+            else:
+                await update.effective_message.reply_text(f"No documents found for '{h(search)}'.", parse_mode="HTML")
+                return
+        
+        # Send documents for this load
+        docs = all_docs.get(load_key, [])
+        if not docs:
+            await update.effective_message.reply_text(f"No documents for {h(load_key)}.", parse_mode="HTML")
+            return
+
+        await update.effective_message.reply_text(
+            f"📁 <b>Documents for {h(load_key)}</b>\n"
+            f"Sending {len(docs)} document(s)...",
+            parse_mode="HTML"
+        )
+
+        for doc in docs:
+            try:
+                await ctx.bot.send_document(
+                    chat_id=update.effective_chat.id,
+                    document=doc["file_id"],
+                    caption=f"📄 {doc.get('type_name', doc['type'])} — {load_key}",
+                )
+            except TelegramError as e:
+                log(f"Failed to send document: {e}")
+                await update.effective_message.reply_text(
+                    f"⚠️ Could not retrieve: {h(doc['filename'])}",
+                    parse_mode="HTML"
+                )
+        return
+
+    # No argument - show current load docs or list of loads with docs
+    job = normalize_job(st.get("job"))
+    
+    if job:
+        load_key = get_load_key(job)
+        docs = all_docs.get(load_key, []) if load_key else []
+        
+        if docs:
+            lines = [f"📁 <b>Documents for {h(load_key)}</b> (current load)\n"]
+            for i, doc in enumerate(docs, 1):
+                lines.append(f"{i}. <b>{h(doc.get('type_name', doc['type']))}</b> — {h(doc['filename'])}")
+            
+            lines.append(f"\nUse /docs {load_key} to download all.")
+            await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+    
+    # Show list of loads with documents
+    if not all_docs:
+        await update.effective_message.reply_text(
+            "📁 <b>No documents saved yet.</b>\n\n"
+            "Upload a PDF while a load is active to save it.",
+            parse_mode="HTML"
+        )
+        return
+
+    lines = ["📁 <b>Saved Documents</b>\n"]
+    for load_key, docs in sorted(all_docs.items(), reverse=True)[:20]:
+        doc_types = ", ".join(set(d.get("type", "?") for d in docs))
+        lines.append(f"• <b>{h(load_key)}</b>: {len(docs)} doc(s) ({h(doc_types)})")
+    
+    if len(all_docs) > 20:
+        lines.append(f"\n... and {len(all_docs) - 20} more loads")
+    
+    lines.append("\nUse /docs &lt;load#&gt; to download documents.")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ============================================================================
 # CALLBACK QUERY HANDLER
 # ============================================================================
 
@@ -1985,6 +2272,15 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("RESET:"):
         action = data.split(":", 1)[1]
         await handle_reset_callback(update, ctx, action)
+        return
+
+    # Document save callbacks
+    if data.startswith("DOC_SAVE:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            doc_type = parts[1]
+            file_unique_id = parts[2]
+            await handle_doc_save_callback(update, ctx, doc_type, file_unique_id)
         return
 
     # ETA requests
@@ -2258,6 +2554,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.add_handler(CommandHandler("deleteall", deleteall_cmd))
     app.add_handler(CommandHandler("leave", leave_cmd))
+    app.add_handler(CommandHandler("docs", docs_cmd))
 
     app.add_handler(CallbackQueryHandler(on_callback))
     
@@ -2271,6 +2568,9 @@ def main() -> None:
         )
     except Exception as e:
         log(f"Failed to add edited location handler: {e}")
+
+    # Document (PDF) handler
+    app.add_handler(MessageHandler(filters.Document.PDF, on_document))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
