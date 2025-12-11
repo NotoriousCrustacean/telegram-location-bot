@@ -522,19 +522,62 @@ async def calc_eta(st: dict, origin: Tuple[float, float], addr: str) -> dict:
 # ============================================================================
 # LOAD PARSING
 # ============================================================================
-LOAD_NUM_PATTERN = re.compile(r"Load\s*#\s*(\S+)", re.I)
-RATE_PATTERN = re.compile(r"Rate\s*:\s*\$?([\d,]+(?:\.\d{2})?)", re.I)
-MILES_PATTERN = re.compile(r"Total\s*mi\s*:\s*([\d,]+)", re.I)
-PU_TIME_PATTERN = re.compile(r"PU\s*time\s*:\s*(.+?)(?:\n|$)", re.I)
-DEL_TIME_PATTERN = re.compile(r"DEL\s*time\s*:\s*(.+?)(?:\n|$)", re.I)
-PU_ADDR_PATTERN = re.compile(r"PU\s*Address\s*:\s*(.+?)(?=\n\s*\n|\nDEL|\n-{3,}|$)", re.I | re.S)
-DEL_ADDR_PATTERN = re.compile(r"DEL\s*Address\s*:\s*(.+?)(?=\n\s*\n|\n-{3,}|\nTotal|$)", re.I | re.S)
+LOAD_NUM_PATTERN = re.compile(r"Load\s*#\s*:?\s*([A-Za-z0-9\-]+?)(?=BL|Reference|Pickup|Delivery|\s*\n|$)", re.I)
+# Rate patterns: "$1,400.00" or "5050 $" or "Rate: $5050" or "Rate : 5050 $"
+RATE_PATTERN = re.compile(r"Rate\s*:?\s*\$?\s*([\d,]+(?:\.\d{2})?)\s*\$?", re.I)
+# Miles patterns: "Total mi : 561" or "Loaded mi : 2467"
+MILES_PATTERN = re.compile(r"(?:Total|Loaded)\s*mi\s*:?\s*([\d,]+)", re.I)
+PU_TIME_PATTERN = re.compile(r"PU\s*time\s*:\s*(.+?)(?=\s*PU\s*Address|$)", re.I)
+DEL_TIME_PATTERN = re.compile(r"DEL\s*time\s*:\s*(.+?)(?=\s*DEL\s*Address|$)", re.I)
+PU_ADDR_PATTERN = re.compile(r"PU\s*Address\s*:\s*(.+?)(?=DEL\s*time|DEL\s*Address|\n-{3,}|$)", re.I | re.S)
+DEL_ADDR_PATTERN = re.compile(r"DEL\s*Address\s*:\s*(.+?)(?=-{3,}|Total\s*mi|Loaded\s*mi|Trailer|$)", re.I | re.S)
+
+# Additional reference number patterns - stop at next field marker
+BL_PATTERN = re.compile(r"BL\s*#\s*:?\s*(\d+)", re.I)
+PO_PATTERN = re.compile(r"PO\s*#\s*:?\s*(\d+)", re.I)
+DELIVERY_NUM_PATTERN = re.compile(r"Delivery\s*#\s*:?\s*([A-Za-z0-9\-]+?)(?=-{3,}|DK|ZN|\s*\n|$)", re.I)
+REFERENCE_PATTERN = re.compile(r"Reference\s*#'?s?\s*:?\s*(.+?)(?=\n|PO|Delivery|$)", re.I)
+PICKUP_NUM_PATTERN = re.compile(r"Pickup\s*#\s*:?\s*([A-Za-z0-9\-]+?)(?=ZN|DK|\s*\n|$)", re.I)
+
+def parse_date_flexible(date_str: str) -> Optional[str]:
+    """
+    Parse various date formats and return normalized "Mon DD, YYYY" format.
+    Handles:
+    - "12/11/25" -> "Dec 11, 2025"
+    - "12/11/2025" -> "Dec 11, 2025"
+    - "Dec 11, 2025" -> "Dec 11, 2025"
+    - "December 11, 2025" -> "Dec 11, 2025"
+    """
+    if not date_str:
+        return None
+    
+    date_str = date_str.strip()
+    
+    # Already in "Mon DD, YYYY" format
+    if re.match(r'\w{3}\s+\d{1,2},?\s+\d{4}', date_str):
+        return date_str
+    
+    # MM/DD/YY or MM/DD/YYYY format
+    m = re.match(r'(\d{1,2})/(\d{1,2})/(\d{2,4})', date_str)
+    if m:
+        month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if year < 100:
+            year += 2000
+        
+        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        if 1 <= month <= 12:
+            return f"{months[month-1]} {day}, {year}"
+    
+    return date_str
 
 def parse_time_window(time_str: str) -> dict:
     """
     Parse time strings like:
     - "Dec 10, 2025 08:00 -14:00 FCFS"
     - "Dec 11, 2025 00:01-23:59 FCFS"
+    - "12/11/25 08:00"
+    - "12/11/25 READY NOW"
     - "Dec 10, 2025 08:00"
     
     Returns: {
@@ -542,7 +585,7 @@ def parse_time_window(time_str: str) -> dict:
         "date": "Dec 10, 2025",
         "early": "08:00",
         "late": "14:00" or None,
-        "note": "FCFS" or None,
+        "note": "FCFS" or "READY NOW" or None,
         "early_dt": datetime or None,
         "late_dt": datetime or None
     }
@@ -560,38 +603,78 @@ def parse_time_window(time_str: str) -> dict:
         "late_dt": None,
     }
     
-    # Extract note like "FCFS", "APPT", etc (at end of string)
-    note_match = re.search(r'\b(FCFS|APPT|BY APPT|APPOINTMENT)\s*$', time_str, re.I)
+    # Extract notes like "FCFS", "APPT", "READY NOW" etc
+    note_match = re.search(r'\b(FCFS|APPT|BY APPT|APPOINTMENT|READY NOW|ASAP)\s*$', time_str, re.I)
     if note_match:
         result["note"] = note_match.group(1).upper()
         time_str = time_str[:note_match.start()].strip()
     
-    # Pattern: "Dec 10, 2025 08:00 -14:00" or "Dec 10, 2025 08:00-14:00"
+    # Try multiple date formats
+    
+    # Format 1: "Dec 10, 2025 08:00 -14:00" or "Dec 10, 2025 08:00-14:00"
     window_match = re.search(
         r'(\w{3}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2})\s*[-–to]+\s*(\d{1,2}:\d{2})',
         time_str, re.I
     )
     
     if window_match:
-        # Clean up date format
         date_str = window_match.group(1).strip()
-        date_str = re.sub(r',\s*', ' ', date_str)  # Remove any existing commas
+        date_str = re.sub(r',\s*', ' ', date_str)
         date_str = re.sub(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', r'\1 \2, \3', date_str)
         result["date"] = date_str
         result["early"] = window_match.group(2)
         result["late"] = window_match.group(3)
-    else:
-        # Single time: "Dec 10, 2025 08:00"
-        single_match = re.search(
-            r'(\w{3}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2})',
-            time_str, re.I
-        )
-        if single_match:
-            date_str = single_match.group(1).strip()
-            date_str = re.sub(r',\s*', ' ', date_str)
-            date_str = re.sub(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', r'\1 \2, \3', date_str)
-            result["date"] = date_str
-            result["early"] = single_match.group(2)
+        return result
+    
+    # Format 2: "12/11/25 08:00-14:00" (MM/DD/YY with window)
+    window_match2 = re.search(
+        r'(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}:\d{2})\s*[-–to]+\s*(\d{1,2}:\d{2})',
+        time_str, re.I
+    )
+    
+    if window_match2:
+        result["date"] = parse_date_flexible(window_match2.group(1))
+        result["early"] = window_match2.group(2)
+        result["late"] = window_match2.group(3)
+        return result
+    
+    # Format 3: "Dec 10, 2025 08:00" (single time, Mon DD YYYY)
+    single_match = re.search(
+        r'(\w{3}\s+\d{1,2},?\s+\d{4})\s+(\d{1,2}:\d{2})',
+        time_str, re.I
+    )
+    if single_match:
+        date_str = single_match.group(1).strip()
+        date_str = re.sub(r',\s*', ' ', date_str)
+        date_str = re.sub(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', r'\1 \2, \3', date_str)
+        result["date"] = date_str
+        result["early"] = single_match.group(2)
+        return result
+    
+    # Format 4: "12/11/25 08:00" (single time, MM/DD/YY)
+    single_match2 = re.search(
+        r'(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}:\d{2})',
+        time_str, re.I
+    )
+    if single_match2:
+        result["date"] = parse_date_flexible(single_match2.group(1))
+        result["early"] = single_match2.group(2)
+        return result
+    
+    # Format 5: "12/11/25" or "12/11/25 READY NOW" (date only, no time)
+    date_only = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', time_str, re.I)
+    if date_only:
+        result["date"] = parse_date_flexible(date_only.group(1))
+        return result
+    
+    # Format 6: "Dec 10, 2025" (date only)
+    date_only2 = re.search(r'(\w{3}\s+\d{1,2},?\s+\d{4})', time_str, re.I)
+    if date_only2:
+        date_str = date_only2.group(1).strip()
+        date_str = re.sub(r',\s*', ' ', date_str)
+        date_str = re.sub(r'(\w{3})\s+(\d{1,2})\s+(\d{4})', r'\1 \2, \3', date_str)
+        result["date"] = date_str
+        return result
     
     return result
 
@@ -718,29 +801,46 @@ def check_eta_vs_window(eta_seconds: float, tw: dict, tz_name: str) -> dict:
         }
 
 def clean_address(addr: str) -> str:
+    """Clean and normalize address from load sheet."""
     if not addr:
         return ""
     
-    lines = []
-    for ln in addr.strip().split("\n"):
-        ln = ln.strip()
-        if not ln or len(ln) < 2:
-            continue
-        
-        ln_lower = ln.lower()
-        if any(skip in ln_lower for skip in ["---", "===", "total mi", "rate :", "trailer", "failure"]):
-            break
-        
-        lines.append(ln)
+    # Check if it's a comma-separated single line (like "Company,123 St,City,State ZIP,USA")
+    # vs multi-line format
+    addr = addr.strip()
     
-    if not lines:
-        return ""
+    # If no newlines but has commas, it's already comma-separated
+    if "\n" not in addr and "," in addr:
+        # Just clean it up
+        result = addr
+    else:
+        # Multi-line format - join with commas
+        lines = []
+        for ln in addr.strip().split("\n"):
+            ln = ln.strip()
+            if not ln or len(ln) < 2:
+                continue
+            
+            ln_lower = ln.lower()
+            if any(skip in ln_lower for skip in ["---", "===", "total mi", "loaded mi", "rate :", "rate:", "trailer", "failure"]):
+                break
+            
+            lines.append(ln)
+        
+        if not lines:
+            return ""
+        
+        result = ", ".join(lines)
     
-    result = ", ".join(lines)
+    # Clean up
     result = re.sub(r'\s+', ' ', result)
     result = re.sub(r',\s*,', ',', result)
+    result = re.sub(r'\s*,\s*', ', ', result)  # Normalize comma spacing
     
-    return result.strip()
+    # Remove trailing ,USA if present (geocoder doesn't need it)
+    result = re.sub(r',\s*USA\s*$', '', result, flags=re.I)
+    
+    return result.strip(' ,')
 
 def parse_load(text: str) -> Optional[dict]:
     if "pu address" not in text.lower() or "del address" not in text.lower():
@@ -748,10 +848,32 @@ def parse_load(text: str) -> Optional[dict]:
     
     log("Parsing load...")
     
+    # Primary load number
     load_num = None
     m = LOAD_NUM_PATTERN.search(text)
     if m:
         load_num = m.group(1).strip()
+    
+    # Additional reference numbers
+    bl_num = None
+    m = BL_PATTERN.search(text)
+    if m:
+        bl_num = m.group(1).strip()
+    
+    po_num = None
+    m = PO_PATTERN.search(text)
+    if m:
+        po_num = m.group(1).strip()
+    
+    delivery_num = None
+    m = DELIVERY_NUM_PATTERN.search(text)
+    if m:
+        delivery_num = m.group(1).strip()
+    
+    pickup_num = None
+    m = PICKUP_NUM_PATTERN.search(text)
+    if m:
+        pickup_num = m.group(1).strip()
     
     rate = None
     m = RATE_PATTERN.search(text)
@@ -794,25 +916,45 @@ def parse_load(text: str) -> Optional[dict]:
     
     job_id = hashlib.sha1(f"{load_num}|{pu_addr}|{del_addr}".encode()).hexdigest()[:10]
     
+    # Build references dict with all found numbers
+    refs = {}
+    if bl_num:
+        refs["bl"] = bl_num
+    if po_num:
+        refs["po"] = po_num
+    if delivery_num:
+        refs["delivery"] = delivery_num
+    if pickup_num:
+        refs["pickup"] = pickup_num
+    
     job = {
         "id": job_id,
         "created_at": now_iso(),
-        "meta": {"load_number": load_num, "rate": rate, "miles": miles},
+        "meta": {
+            "load_number": load_num,
+            "rate": rate,
+            "miles": miles,
+            "refs": refs if refs else None,
+        },
         "pu": {
             "addr": pu_addr,
             "time": pu_time,
+            "num": pickup_num,  # Pickup # if different from load
             "status": {"arr": None, "load": None, "dep": None, "comp": None},
             "docs": {"pti": False, "bol": False},
         },
         "del": [{
             "addr": del_addr,
             "time": del_time,
+            "num": delivery_num,  # Delivery #
             "status": {"arr": None, "del": None, "dep": None, "comp": None, "skip": False},
             "docs": {"pod": False},
         }],
     }
     
-    log(f"Parsed: {load_num} | ${rate} | {miles}mi")
+    # Log what we found
+    refs_str = ", ".join(f"{k}={v}" for k, v in refs.items()) if refs else "none"
+    log(f"Parsed: {load_num} | ${rate} | {miles}mi | refs: {refs_str}")
     return job
 
 def get_job(st: dict) -> Optional[dict]:
@@ -1135,6 +1277,7 @@ def build_new_load_message(job: dict) -> str:
     meta = job.get("meta", {})
     pu = job.get("pu", {})
     dels = job.get("del", [])
+    refs = meta.get("refs", {}) or {}
     
     # Calculate rate per mile if available
     rpm = ""
@@ -1158,13 +1301,28 @@ def build_new_load_message(job: dict) -> str:
         elif isinstance(del_time, str) and del_time:
             del_time_str = f"\n🕐 {del_time}"
     
+    # Build reference numbers section
+    refs_lines = []
+    if refs.get("bl"):
+        refs_lines.append(f"BL# {refs['bl']}")
+    if refs.get("po"):
+        refs_lines.append(f"PO# {refs['po']}")
+    if refs.get("pickup"):
+        refs_lines.append(f"PU# {refs['pickup']}")
+    if refs.get("delivery"):
+        refs_lines.append(f"DEL# {refs['delivery']}")
+    
+    refs_str = ""
+    if refs_lines:
+        refs_str = "\n<i>" + " • ".join(refs_lines) + "</i>\n"
+    
     return f"""
 <b>📦 NEW LOAD DETECTED</b>
 <code>━━━━━━━━━━━━━━━━━━━━━━</code>
 
 <b>{load_label(job)}</b>
 {money(meta.get('rate'))}  •  {meta.get('miles') or '—'} mi
-{rpm}
+{rpm}{refs_str}
 <b>📍 Pickup</b>
 {h(short_addr(pu.get('addr', ''), 50))}{pu_time_str}
 
